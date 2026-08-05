@@ -553,13 +553,15 @@ function repeatsTabHTML(){
       <select id="orderSheetWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
         ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
       </select>
+      <label>Order date &amp; time (when this order was placed)</label>
+      <input type="datetime-local" id="orderSheetDateTime" style="max-width:280px; margin-bottom:12px;">
       <div class="btn-row" style="margin-top:0;">
         <label class="btn btn-primary" style="position:relative;">
           Upload order sheet
           <input type="file" id="orderSheetInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
         </label>
       </div>
-      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>, <span class="mono">last order date</span>.</p>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>. Extra columns (stock, sales history, etc.) are fine — they're just ignored for this upload.</p>
       <div id="orderSheetResult"></div>
     </div>
     <div class="card">
@@ -573,14 +575,26 @@ function repeatsTabHTML(){
 function initRepeatsTab(){
   const input = document.getElementById('orderSheetInput');
   if(input) input.addEventListener('change', handleOrderSheetUpload);
+  const dtInput = document.getElementById('orderSheetDateTime');
+  if(dtInput){
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    dtInput.value = now.toISOString().slice(0,16);
+  }
   loadRepeats();
 }
 
 async function handleOrderSheetUpload(e){
   const file = e.target.files[0];
   const warehouseId = document.getElementById('orderSheetWarehouseSelect').value;
+  const dateTimeVal = document.getElementById('orderSheetDateTime').value;
   const resultEl = document.getElementById('orderSheetResult');
   if(!file) return;
+  if(!dateTimeVal){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please set the order date & time first.</p>`;
+    e.target.value = '';
+    return;
+  }
   resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
 
   const reader = new FileReader();
@@ -603,15 +617,16 @@ async function handleOrderSheetUpload(e){
     const itemCol = find('item', 'name') || find('item');
     const packCol = find('pack');
     const distCol = find('distributor');
-    const qtyCol = cols.find(c => c.toLowerCase().trim() === 'qty' || c.toLowerCase().includes('qty') && !c.toLowerCase().includes('place'));
-    const dateCol = find('last', 'order', 'date') || find('order', 'date');
+    const qtyCol = cols.find(c => {
+      const lc = c.toLowerCase().trim();
+      return (lc === 'qty' || lc.includes('qty')) && !lc.includes('place');
+    });
 
-    if(!itemCol || !qtyCol || !dateCol){
+    if(!itemCol || !qtyCol){
       resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
       return;
     }
 
-    // fetch reference data once
     const { data: itemsData } = await sb.from('items').select('id, item_name, pack_size');
     const { data: distData } = await sb.from('distributors').select('id, name');
     const { data: aliasData } = await sb.from('distributor_aliases').select('alias, distributor_id');
@@ -640,40 +655,39 @@ async function handleOrderSheetUpload(e){
       return distByName[key] || distByAlias[key] || null;
     }
 
-    // group rows by date
-    const byDate = {};
     let itemUnmatched = 0, distUnmatched = 0;
+    const runItemsToInsert = [];
     rows.forEach(r=>{
-      const dateRaw = r[dateCol];
-      let dateStr;
-      if(dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0,10);
-      else {
-        const parsed = new Date(dateRaw);
-        dateStr = isNaN(parsed) ? String(dateRaw) : parsed.toISOString().slice(0,10);
-      }
       const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
       if(!itemId){ itemUnmatched++; return; }
       const distId = distCol ? resolveDistributor(r[distCol]) : null;
       if(distCol && r[distCol] && !distId) distUnmatched++;
       const qty = parseInt(r[qtyCol]) || 0;
-
-      if(!byDate[dateStr]) byDate[dateStr] = [];
-      byDate[dateStr].push({ item_id: itemId, qty, distributor_id: distId });
+      runItemsToInsert.push({ item_id: itemId, qty, distributor_id: distId });
     });
 
-    let runsCreated = 0, itemsLogged = 0;
-    for(const [dateStr, items] of Object.entries(byDate)){
-      const { data: run, error: runErr } = await sb.from('order_runs')
-        .insert({ warehouse_id: warehouseId, run_at: `${dateStr}T12:00:00Z` })
-        .select().single();
-      if(runErr || !run) continue;
-      runsCreated++;
-      const runItems = items.map(i => ({ order_run_id: run.id, item_id: i.item_id, qty: i.qty, distributor_id: i.distributor_id }));
-      const { error: itemsErr } = await sb.from('order_run_items').insert(runItems);
-      if(!itemsErr) itemsLogged += runItems.length;
+    if(!runItemsToInsert.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be matched. ${itemUnmatched} rows had unrecognized items.</p>`;
+      e.target.value = '';
+      return;
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — logged ${itemsLogged} items across ${runsCreated} day(s).${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}</p>`;
+    const runAtIso = new Date(dateTimeVal).toISOString();
+    const { data: run, error: runErr } = await sb.from('order_runs')
+      .insert({ warehouse_id: warehouseId, run_at: runAtIso })
+      .select().single();
+
+    if(runErr || !run){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't create order run: ${escapeHtml(runErr?.message || 'unknown error')}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const finalItems = runItemsToInsert.map(i => ({ ...i, order_run_id: run.id }));
+    const { error: itemsErr } = await sb.from('order_run_items').insert(finalItems);
+    const itemsLogged = itemsErr ? 0 : finalItems.length;
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}</p>`;
     e.target.value = '';
     loadRepeats();
   };
