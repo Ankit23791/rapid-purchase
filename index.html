@@ -560,6 +560,7 @@ function repeatsTabHTML(){
           Upload order sheet
           <input type="file" id="orderSheetInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
         </label>
+        <button class="btn btn-ghost" id="downloadSampleOrderSheetBtn">Download sample format</button>
       </div>
       <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>. Extra columns (stock, sales history, etc.) are fine — they're just ignored for this upload.</p>
       <div id="orderSheetResult"></div>
@@ -575,6 +576,8 @@ function repeatsTabHTML(){
 function initRepeatsTab(){
   const input = document.getElementById('orderSheetInput');
   if(input) input.addEventListener('change', handleOrderSheetUpload);
+  const sampleBtn = document.getElementById('downloadSampleOrderSheetBtn');
+  if(sampleBtn) sampleBtn.addEventListener('click', downloadSampleOrderSheetFormat);
   const dtInput = document.getElementById('orderSheetDateTime');
   if(dtInput){
     const now = new Date();
@@ -582,6 +585,18 @@ function initRepeatsTab(){
     dtInput.value = now.toISOString().slice(0,16);
   }
   loadRepeats();
+}
+
+function downloadSampleOrderSheetFormat(){
+  const rows = [
+    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited', 'Qty': 2 },
+    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited', 'Qty': 5 },
+    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Distributor Name order place to': 'Neelkanth Pharma Logistics Private Limited', 'Qty': 3 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Order Sheet');
+  XLSX.writeFile(wb, 'sample_order_sheet_format.xlsx');
 }
 
 async function handleOrderSheetUpload(e){
