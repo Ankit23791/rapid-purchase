@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RapidSurge Purchase</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --ink:#1C2B2B;
+    --paper:#F7F5F0;
+    --card:#FFFFFF;
+    --teal:#0F6B63;
+    --teal-dark:#0A4B45;
+    --amber:#C98A2C;
+    --green:#2F8F5B;
+    --red:#B4432E;
+    --border:#E3E1DA;
+    --muted:#6B7876;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:'Inter',sans-serif; -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,.display{ font-family:'Space Grotesk',sans-serif; letter-spacing:-0.01em; }
+  .mono{ font-family:'IBM Plex Mono',monospace; }
+  button{ font-family:inherit; cursor:pointer; }
+  input, select, textarea{ font-family:inherit; }
+
+  /* ---------- Top bar ---------- */
+  .topbar{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px 20px; background:var(--teal-dark); color:#fff;
+  }
+  .topbar .brand{ display:flex; align-items:center; gap:10px; font-family:'Space Grotesk'; font-weight:700; font-size:18px; }
+  .topbar .brand .dot{ width:10px; height:10px; border-radius:50%; background:var(--amber); }
+  .topbar select{
+    background:rgba(255,255,255,0.12); color:#fff; border:1px solid rgba(255,255,255,0.25);
+    border-radius:8px; padding:8px 10px; font-size:14px;
+  }
+  .topbar select option{ color:#111; }
+  .topbar .right{ display:flex; align-items:center; gap:12px; }
+  .topbar button.logout{
+    background:transparent; border:1px solid rgba(255,255,255,0.3); color:#fff;
+    padding:7px 12px; border-radius:8px; font-size:13px;
+  }
+  .topbar button.logout:hover{ background:rgba(255,255,255,0.1); }
+
+  .tabs{ display:flex; gap:4px; padding:10px 20px 0; background:var(--paper); border-bottom:1px solid var(--border); }
+  .tabs button{
+    background:none; border:none; padding:10px 16px; font-size:14px; font-weight:600;
+    color:var(--muted); border-bottom:2px solid transparent;
+  }
+  .tabs button.active{ color:var(--teal-dark); border-bottom:2px solid var(--teal); }
+
+  .wrap{ max-width:1100px; margin:0 auto; padding:24px 20px 80px; }
+  .card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:22px; margin-bottom:18px; }
+  .card h2{ margin:0 0 4px; font-size:19px; }
+  .card p.hint{ color:var(--muted); font-size:13.5px; margin:0 0 16px; }
+
+  label{ display:block; font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px; }
+  textarea, input[type=text], input[type=email], input[type=password], input[type=number]{
+    width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:9px;
+    font-size:14px; background:#fff; color:var(--ink);
+  }
+  textarea:focus, input:focus, select:focus{ outline:2px solid var(--teal); outline-offset:1px; }
+  textarea{ min-height:160px; resize:vertical; }
+
+  .btn{
+    display:inline-flex; align-items:center; gap:8px; padding:11px 18px; border-radius:9px;
+    border:none; font-weight:600; font-size:14px;
+  }
+  .btn-primary{ background:var(--teal); color:#fff; }
+  .btn-primary:hover{ background:var(--teal-dark); }
+  .btn-primary:disabled{ background:#a9c2bf; cursor:not-allowed; }
+  .btn-ghost{ background:transparent; border:1px solid var(--border); color:var(--ink); }
+  .btn-ghost:hover{ background:#F0EEE7; }
+  .btn-row{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+
+  /* ---------- Login ---------- */
+  .login-screen{ min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .login-card{ width:100%; max-width:380px; background:#fff; border:1px solid var(--border); border-radius:16px; padding:32px; }
+  .login-card .brand{ display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .login-card .brand .dot{ width:11px; height:11px; border-radius:50%; background:var(--amber); }
+  .login-card h1{ font-size:22px; margin:0 0 4px; }
+  .login-card p{ color:var(--muted); font-size:13.5px; margin:0 0 22px; }
+  .field{ margin-bottom:14px; }
+  .error-msg{ background:#FBEAE6; border:1px solid #EFC6BA; color:var(--red); padding:10px 12px; border-radius:8px; font-size:13px; margin-bottom:14px; }
+
+  /* ---------- Suggestion cards ---------- */
+  .item-row{ border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:12px; background:#fff; }
+  .item-row .item-head{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .item-row .item-name{ font-weight:700; font-size:15px; }
+  .item-row .item-meta{ font-size:12.5px; color:var(--muted); }
+  .qty-badge{ font-family:'IBM Plex Mono'; background:#EEF4F1; color:var(--teal-dark); padding:3px 9px; border-radius:6px; font-size:13px; font-weight:500; }
+
+  .ladder{ display:flex; flex-direction:column; gap:6px; }
+  .ladder-item{
+    display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:8px; border:1px solid var(--border);
+  }
+  .ladder-item.top{ border-color:var(--teal); background:#F1F7F5; }
+  .rank-chip{
+    width:22px; height:22px; border-radius:50%; background:var(--teal); color:#fff; font-size:11.5px;
+    display:flex; align-items:center; justify-content:center; font-weight:700; flex-shrink:0;
+  }
+  .ladder-item.rank2 .rank-chip, .ladder-item.rank3 .rank-chip, .ladder-item.rank4 .rank-chip{ background:#9AAFAC; }
+  .ladder-dist{ font-weight:600; font-size:13.5px; flex:1; min-width:120px; }
+  .ladder-stats{ font-size:12px; color:var(--muted); font-family:'IBM Plex Mono'; white-space:nowrap; }
+  .no-history{ color:var(--muted); font-size:13px; font-style:italic; padding:8px 0; }
+
+  select.choose{ margin-top:10px; width:100%; max-width:320px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; font-size:13px; }
+
+  table.summary{ width:100%; border-collapse:collapse; font-size:13.5px; }
+  table.summary th, table.summary td{ text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
+  table.summary th{ color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+
+  .empty-state{ text-align:center; padding:40px 20px; color:var(--muted); }
+
+  .badge-warn{ display:inline-block; background:#FDF2E3; color:var(--amber); border:1px solid #F0DBB0; padding:2px 8px; border-radius:6px; font-size:11.5px; font-weight:600; }
+
+  .grid-2{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:600px){ .grid-2{ grid-template-columns:1fr; } }
+
+  .spinner{ display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.4); border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  ul.admin-list{ list-style:none; padding:0; margin:0; }
+  ul.admin-list li{ display:flex; justify-content:space-between; padding:9px 0; border-bottom:1px solid var(--border); font-size:14px; }
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+// ============================================================
+// CONFIG — your Supabase project
+// ============================================================
+const SUPABASE_URL = "https://ffsobagjqcwqgmoyphlu.supabase.co";
+const SUPABASE_KEY = "sb_publishable_VGM9tD_t4FnIpEx-anuN8g_3DpR3l50";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+let state = {
+  session: null,
+  warehouses: [],
+  currentWarehouse: null,
+  activeTab: 'order',
+  parsedRows: [],       // {raw, qty, item, candidates, status}
+  suggestions: {},      // item_id -> [ {distributor_name, last_purchased, avg_margin_pct, ...} ]
+  chosen: {},           // item_id -> distributor_id chosen
+  loadingOrder: false,
+};
+
+const app = document.getElementById('app');
+
+// ============================================================
+// RENDER ROOT
+// ============================================================
+function render(){
+  if(!state.session){
+    renderLogin();
+  } else {
+    renderMain();
+  }
+}
+
+// ============================================================
+// LOGIN
+// ============================================================
+function renderLogin(errorMsg){
+  app.innerHTML = `
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="brand"><span class="dot"></span><strong>RapidSurge</strong></div>
+        <h1>Purchase Team Login</h1>
+        <p>Sign in with your team account to continue.</p>
+        ${errorMsg ? `<div class="error-msg">${errorMsg}</div>` : ''}
+        <form id="loginForm">
+          <div class="field">
+            <label>Email</label>
+            <input type="email" id="loginEmail" required autocomplete="username">
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input type="password" id="loginPassword" required autocomplete="current-password">
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%; justify-content:center;" id="loginBtn">Sign in</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('loginForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const btn = document.getElementById('loginBtn');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Signing in...';
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPassword').value;
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if(error){
+      renderLogin(error.message);
+      return;
+    }
+    state.session = data.session;
+    await loadWarehouses();
+    render();
+  });
+}
+
+// ============================================================
+// LOAD WAREHOUSES
+// ============================================================
+async function loadWarehouses(){
+  const { data, error } = await sb.from('warehouses').select('*').eq('active', true).order('name');
+  if(!error && data){
+    state.warehouses = data;
+    if(!state.currentWarehouse && data.length) state.currentWarehouse = data[0].id;
+  }
+}
+
+// ============================================================
+// MAIN SHELL
+// ============================================================
+function renderMain(){
+  app.innerHTML = `
+    <div class="topbar">
+      <div class="brand"><span class="dot"></span> RapidSurge Purchase</div>
+      <div class="right">
+        <select id="warehouseSelect">
+          ${state.warehouses.map(w => `<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${w.name}</option>`).join('')}
+        </select>
+        <button class="logout" id="logoutBtn">Log out</button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
+      <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
+      <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>
+    </div>
+    <div class="wrap" id="tabContent"></div>
+  `;
+  document.getElementById('warehouseSelect').addEventListener('change', (e)=>{
+    state.currentWarehouse = e.target.value;
+    state.suggestions = {}; state.parsedRows = []; state.chosen = {};
+    renderTabContent();
+  });
+  document.getElementById('logoutBtn').addEventListener('click', async ()=>{
+    await sb.auth.signOut();
+    state.session = null;
+    render();
+  });
+  document.querySelectorAll('.tabs button').forEach(b=>{
+    b.addEventListener('click', ()=>{ state.activeTab = b.dataset.tab; render(); });
+  });
+  renderTabContent();
+}
+
+function renderTabContent(){
+  const el = document.getElementById('tabContent');
+  if(state.activeTab === 'order') el.innerHTML = orderTabHTML();
+  else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
+  else el.innerHTML = adminTabHTML();
+  attachTabHandlers();
+}
+
+// ============================================================
+// ORDER TAB
+// ============================================================
+function orderTabHTML(){
+  return `
+    <div class="card">
+      <h2>Paste your order list</h2>
+      <p class="hint">One item per line: <span class="mono">item name, pack size, quantity</span> — separated by a comma or tab. If you use the item <strong>code</strong> instead of name, pack size can be left blank since the code is already exact. Or upload a .csv/.xlsx with the same columns.</p>
+      <textarea id="orderInput" placeholder="Paracetamol 500 Tablet, 10 Tablet, 20&#10;Azithromycin 500 Tablet, 6 Tablet, 10&#10;M0004521, , 50"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="matchBtn">Find distributors</button>
+        <label class="btn btn-ghost" style="position:relative;">
+          Upload file
+          <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="exportBtn" style="display:${state.parsedRows.length ? 'inline-flex' : 'none'};">Download Excel</button>
+      </div>
+    </div>
+    <div id="resultsArea">${resultsHTML()}</div>
+  `;
+}
+
+function resultsHTML(){
+  if(state.loadingOrder){
+    return `<div class="card empty-state">Matching items and finding distributors...</div>`;
+  }
+  if(!state.parsedRows.length){
+    return `<div class="card empty-state">Paste or upload your order list above to get started.</div>`;
+  }
+  return state.parsedRows.map(row => itemRowHTML(row)).join('');
+}
+
+function itemRowHTML(row){
+  if(row.status === 'not_found'){
+    return `
+      <div class="item-row">
+        <div class="item-head">
+          <div><span class="badge-warn">Not matched</span> <span class="item-name">${escapeHtml(row.raw)}</span></div>
+          <span class="qty-badge">Qty ${row.qty}</span>
+        </div>
+        <p class="no-history">${row.note ? escapeHtml(row.note) : "Couldn't find this in your item master list. Add it there, or check spelling."}</p>
+      </div>
+    `;
+  }
+  if(row.status === 'ambiguous'){
+    return `
+      <div class="item-row">
+        <div class="item-head">
+          <div><span class="badge-warn">Multiple pack sizes — pick one</span> <span class="item-name">${escapeHtml(row.raw)}</span></div>
+          <span class="qty-badge">Qty ${row.qty}</span>
+        </div>
+        <p class="no-history">This name matches ${row.options.length} different pack sizes. Re-enter the line with the pack size, or use the item code instead:</p>
+        <table class="summary">
+          <tr><th>Pack size</th><th>Code</th></tr>
+          ${row.options.map(o=>`<tr><td>${escapeHtml(o.pack_size)}</td><td class="mono">${escapeHtml(o.code)}</td></tr>`).join('')}
+        </table>
+      </div>
+    `;
+  }
+  const item = row.item;
+  const sugg = state.suggestions[item.id] || [];
+  const ladder = sugg.length ? `
+    <div class="ladder">
+      ${sugg.map((s,i)=>`
+        <div class="ladder-item ${i===0?'top':'rank'+(i+1)}">
+          <div class="rank-chip">${i+1}</div>
+          <div class="ladder-dist">${escapeHtml(s.distributor_name)}</div>
+          <div class="ladder-stats">last: ${s.last_purchased} · margin ${s.avg_margin_pct}%</div>
+        </div>
+      `).join('')}
+    </div>
+    <select class="choose" data-item="${item.id}">
+      <option value="">Choose distributor for this item...</option>
+      ${sugg.map(s=>`<option value="${s.distributor_id}" ${state.chosen[item.id]===s.distributor_id?'selected':''}>${escapeHtml(s.distributor_name)}</option>`).join('')}
+    </select>
+  ` : `<p class="no-history">No purchase history for this item at this warehouse yet — call distributors manually or check Pharmarack.</p>`;
+
+  return `
+    <div class="item-row">
+      <div class="item-head">
+        <div><span class="item-name">${escapeHtml(item.item_name)}</span> <span class="item-meta">${escapeHtml(item.pack_size||'')} · ${escapeHtml(item.code)}</span></div>
+        <span class="qty-badge">Qty ${row.qty}</span>
+      </div>
+      ${ladder}
+    </div>
+  `;
+}
+
+function attachTabHandlers(){
+  const matchBtn = document.getElementById('matchBtn');
+  if(matchBtn) matchBtn.addEventListener('click', handleMatch);
+
+  const fileInput = document.getElementById('fileInput');
+  if(fileInput) fileInput.addEventListener('change', handleFileUpload);
+
+  const exportBtn = document.getElementById('exportBtn');
+  if(exportBtn) exportBtn.addEventListener('click', exportExcel);
+
+  document.querySelectorAll('select.choose').forEach(sel=>{
+    sel.addEventListener('change', (e)=>{
+      state.chosen[e.target.dataset.item] = e.target.value || null;
+    });
+  });
+
+  // admin handlers
+  const addWhForm = document.getElementById('addWarehouseForm');
+  if(addWhForm) addWhForm.addEventListener('submit', handleAddWarehouse);
+  const addDistForm = document.getElementById('addDistributorForm');
+  if(addDistForm) addDistForm.addEventListener('submit', handleAddDistributor);
+}
+
+function handleFileUpload(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = (evt)=>{
+    let text = '';
+    if(file.name.endsWith('.csv')){
+      text = evt.target.result;
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, {header:1});
+      text = rows.map(r=>r.join(',')).join('\n');
+    }
+    document.getElementById('orderInput').value = text;
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+// ============================================================
+// MATCH ITEMS + GET SUGGESTIONS
+// ============================================================
+async function handleMatch(){
+  const raw = document.getElementById('orderInput').value.trim();
+  if(!raw) return;
+  state.loadingOrder = true;
+  document.getElementById('resultsArea').innerHTML = resultsHTML();
+
+  const lines = raw.split('\n').map(l=>l.trim()).filter(Boolean);
+  const parsed = lines.map(line=>{
+    const parts = line.split(/\t|,/).map(p=>p.trim());
+    let identifier, pack, qtyRaw;
+    if(parts.length >= 3){ identifier = parts[0]; pack = parts[1]; qtyRaw = parts[2]; }
+    else { identifier = parts[0]; pack = ''; qtyRaw = parts[1]; }
+    const qty = qtyRaw ? (parseInt(qtyRaw.replace(/[^0-9]/g,'')) || 1) : 1;
+    return { raw: identifier, pack, qty };
+  });
+
+  const identifiers = parsed.map(p=>p.raw);
+
+  // try exact code match (unambiguous, pack size not needed)
+  const { data: byCode } = await sb.from('items').select('*').in('code', identifiers);
+  // fetch ALL items matching by name — may return multiple pack-size variants per name
+  const { data: byName } = await sb.from('items').select('*').in('item_name', identifiers);
+
+  const rows = parsed.map(p=>{
+    const codeMatch = (byCode||[]).find(i=>i.code === p.raw);
+    if(codeMatch) return { raw: p.raw, qty: p.qty, item: codeMatch, status: 'matched' };
+
+    const nameCandidates = (byName||[]).filter(i=>i.item_name.toLowerCase() === p.raw.toLowerCase());
+    if(nameCandidates.length === 0){
+      return { raw: p.raw, qty: p.qty, status: 'not_found' };
+    }
+    if(p.pack){
+      const packMatch = nameCandidates.find(i=>String(i.pack_size).toLowerCase().trim() === p.pack.toLowerCase().trim());
+      if(packMatch) return { raw: p.raw, qty: p.qty, item: packMatch, status: 'matched' };
+      return { raw: p.raw, qty: p.qty, status: 'not_found', note: `No match for pack size "${p.pack}". Available: ${nameCandidates.map(c=>c.pack_size).join(', ')}` };
+    }
+    if(nameCandidates.length === 1){
+      return { raw: p.raw, qty: p.qty, item: nameCandidates[0], status: 'matched' };
+    }
+    // multiple pack-size variants exist and no pack size was given — ambiguous
+    return { raw: p.raw, qty: p.qty, status: 'ambiguous', options: nameCandidates };
+  });
+
+  state.parsedRows = rows;
+
+  const itemIds = rows.filter(r=>r.status==='matched').map(r=>r.item.id);
+  if(itemIds.length){
+    const { data: suggData, error } = await sb.rpc('get_distributor_suggestions', {
+      p_warehouse_id: state.currentWarehouse,
+      p_item_ids: itemIds
+    });
+    if(!error && suggData){
+      state.suggestions = {};
+      suggData.forEach(s=>{
+        if(!state.suggestions[s.item_id]) state.suggestions[s.item_id] = [];
+        state.suggestions[s.item_id].push(s);
+      });
+    }
+  }
+
+  state.loadingOrder = false;
+  document.getElementById('resultsArea').innerHTML = resultsHTML();
+  const exportBtn = document.getElementById('exportBtn');
+  if(exportBtn) exportBtn.style.display = state.parsedRows.length ? 'inline-flex' : 'none';
+  attachTabHandlers();
+}
+
+// ============================================================
+// EXPORT TO EXCEL
+// ============================================================
+function exportExcel(){
+  const rows = state.parsedRows.map(r=>{
+    if(r.status === 'not_found'){
+      return { 'Item': r.raw, 'Qty': r.qty, 'Distributor 1':'', 'Distributor 2':'', 'Distributor 3':'', 'Distributor 4':'',
+        'Margin 1':'', 'Margin 2':'', 'Margin 3':'', 'Margin 4':'',
+        'Last Purchased 1':'', 'Last Purchased 2':'', 'Last Purchased 3':'', 'Last Purchased 4':'' };
+    }
+    if(r.status === 'ambiguous'){
+      return { 'Item': `${r.raw} (AMBIGUOUS — pick pack size: ${r.options.map(o=>o.pack_size).join(' / ')})`, 'Qty': r.qty,
+        'Distributor 1':'', 'Distributor 2':'', 'Distributor 3':'', 'Distributor 4':'',
+        'Margin 1':'', 'Margin 2':'', 'Margin 3':'', 'Margin 4':'',
+        'Last Purchased 1':'', 'Last Purchased 2':'', 'Last Purchased 3':'', 'Last Purchased 4':'' };
+    }
+    const sugg = state.suggestions[r.item.id] || [];
+    const s = i => sugg[i] || {};
+    return {
+      'Item': r.item.item_name,
+      'Qty': r.qty,
+      'Distributor 1': s(0).distributor_name||'', 'Distributor 2': s(1).distributor_name||'',
+      'Distributor 3': s(2).distributor_name||'', 'Distributor 4': s(3).distributor_name||'',
+      'Margin 1': s(0).avg_margin_pct||'', 'Margin 2': s(1).avg_margin_pct||'',
+      'Margin 3': s(2).avg_margin_pct||'', 'Margin 4': s(3).avg_margin_pct||'',
+      'Last Purchased 1': s(0).last_purchased||'', 'Last Purchased 2': s(1).last_purchased||'',
+      'Last Purchased 3': s(2).last_purchased||'', 'Last Purchased 4': s(3).last_purchased||''
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!autofilter'] = { ref: ws['!ref'] };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Order');
+  const whName = state.warehouses.find(w=>w.id===state.currentWarehouse)?.name || 'order';
+  XLSX.writeFile(wb, `RapidSurge_Order_${whName}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+// ============================================================
+// MATCH ITEMS TAB — human-reviewed distributor catalog matching
+// ============================================================
+let matchState = {
+  distributors: [],
+  currentDistributor: null,
+  pendingItemIds: [],
+  currentBatch: [],   // [{item_id, item_name, pack_size, candidates:[...]}]
+  reviewedCount: 0,
+  totalPending: 0,
+  loading: false,
+};
+
+function matchTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload a ready-made mapping</h2>
+      <p class="hint">If a distributor has already shared their own item-code mapping (like Jeplus or Acorn did) — a file with <strong>your item code</strong> alongside their code/name — upload it directly here. No review needed, since it's matched by exact code, not guesswork.</p>
+      <label>Distributor</label>
+      <select id="directMapDistributorSelect" style="max-width:360px; margin-bottom:12px;"></select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload mapping file
+          <input type="file" id="directMapFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (name doesn't have to match exactly, just needs to contain these words): a column with <span class="mono">code</span> for your item code, and columns for the distributor's own code and name.</p>
+      <div id="directMapResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Or review a raw catalog</h2>
+      <p class="hint">If you only have a distributor's raw stock list (no mapping to your codes yet), use the matcher below — it suggests candidates for you to confirm, one by one or in bulk via Excel.</p>
+      <label>Distributor</label>
+      <select id="matchDistributorSelect" style="max-width:360px;"></select>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="exportCandidatesBtn" style="display:none;">Download all as Excel</button>
+        <label class="btn btn-ghost" style="position:relative; display:none;" id="uploadDecisionsWrap">
+          Upload decisions
+          <input type="file" id="uploadDecisionsInput" accept=".xlsx,.xls,.csv" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+    </div>
+    <div id="matchArea"></div>
+  `;
+}
+
+async function loadMatchDistributors(){
+  const { data } = await sb.from('distributors').select('id, name').order('name');
+  matchState.distributors = data || [];
+
+  const directSel = document.getElementById('directMapDistributorSelect');
+  if(directSel){
+    directSel.innerHTML = `<option value="">Select a distributor...</option>` +
+      matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  }
+  const directFileInput = document.getElementById('directMapFileInput');
+  if(directFileInput) directFileInput.addEventListener('change', handleDirectMapUpload);
+
+  const sel = document.getElementById('matchDistributorSelect');
+  if(!sel) return;
+  sel.innerHTML = `<option value="">Select a distributor...</option>` +
+    matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  sel.addEventListener('change', async (e)=>{
+    matchState.currentDistributor = e.target.value;
+    matchState.reviewedCount = 0;
+    const hasDistributor = !!matchState.currentDistributor;
+    document.getElementById('exportCandidatesBtn').style.display = hasDistributor ? 'inline-flex' : 'none';
+    document.getElementById('uploadDecisionsWrap').style.display = hasDistributor ? 'inline-flex' : 'none';
+    if(hasDistributor) await loadMatchBatch();
+    else document.getElementById('matchArea').innerHTML = '';
+  });
+  document.getElementById('exportCandidatesBtn').addEventListener('click', exportCandidatesToExcel);
+  document.getElementById('uploadDecisionsInput').addEventListener('change', uploadDecisionsFile);
+}
+
+async function handleDirectMapUpload(e){
+  const file = e.target.files[0];
+  const distributorId = document.getElementById('directMapDistributorSelect').value;
+  const resultEl = document.getElementById('directMapResult');
+  if(!file) return;
+  if(!distributorId){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please select a distributor first.</p>`;
+    e.target.value = '';
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const allCols = Object.keys(rows[0]);
+    const codeCol = allCols.find(k => k.toLowerCase().includes('rio') && k.toLowerCase().includes('code'))
+      || allCols.find(k => ['code','item code','itemcode','our code','rapidsurge code'].includes(k.toLowerCase()));
+    const distCodeCol = allCols.find(k => k.toLowerCase().includes('code') && k !== codeCol);
+    const distNameCol = allCols.find(k => k.toLowerCase().includes('name') && !k.toLowerCase().includes('rio'));
+
+    if(!codeCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a column for your item code. Columns found: ${Object.keys(rows[0]).join(', ')}</p>`;
+      return;
+    }
+
+    const codes = rows.map(r=>String(r[codeCol]).trim());
+    let itemsData = [];
+    for(let i=0; i<codes.length; i+=500){
+      const chunk = codes.slice(i, i+500);
+      const { data } = await sb.from('items').select('id, code').in('code', chunk);
+      if(data) itemsData = itemsData.concat(data);
+    }
+    const codeToId = Object.fromEntries(itemsData.map(i=>[i.code, i.id]));
+
+    const mapped = rows.map(r=>({
+      item_id: codeToId[String(r[codeCol]).trim()],
+      distributor_id: distributorId,
+      distributor_item_code: distCodeCol ? String(r[distCodeCol]) : null,
+      distributor_item_name: distNameCol ? String(r[distNameCol]) : null,
+    })).filter(r=>r.item_id);
+
+    const unmatchedCount = rows.length - mapped.length;
+
+    // check how many of these already have a mapping for this distributor
+    const mappedItemIds = mapped.map(m=>m.item_id);
+    let existingCount = 0;
+    for(let i=0; i<mappedItemIds.length; i+=500){
+      const chunk = mappedItemIds.slice(i, i+500);
+      const { count } = await sb.from('item_distributor_map')
+        .select('item_id', { count: 'exact', head: true })
+        .eq('distributor_id', distributorId)
+        .in('item_id', chunk);
+      existingCount += count || 0;
+    }
+
+    if(existingCount > 0){
+      const proceed = confirm(
+        `${existingCount} of these ${mapped.length} items are already mapped for this distributor. ` +
+        `Uploading will overwrite their existing mapping with this new file's data.\n\nContinue?`
+      );
+      if(!proceed){
+        resultEl.innerHTML = `<p class="no-history">Upload cancelled — no changes made.</p>`;
+        e.target.value = '';
+        return;
+      }
+    }
+
+    let inserted = 0;
+    for(let i=0; i<mapped.length; i+=500){
+      const chunk = mapped.slice(i, i+500);
+      const { error } = await sb.from('item_distributor_map').upsert(chunk, { onConflict: 'item_id,distributor_id' });
+      if(!error) inserted += chunk.length;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}</p>`;
+    e.target.value = '';
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function fetchAllPendingCandidates(distributorId){
+  let all = [];
+  let from = 0;
+  const pageSize = 1000;
+  while(true){
+    const { data, error } = await sb.from('distributor_match_candidates')
+      .select('*')
+      .eq('distributor_id', distributorId)
+      .eq('status', 'pending')
+      .order('item_id')
+      .range(from, from + pageSize - 1);
+    if(error || !data || !data.length) break;
+    all = all.concat(data);
+    if(data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
+async function exportCandidatesToExcel(){
+  const btn = document.getElementById('exportCandidatesBtn');
+  btn.disabled = true; btn.textContent = 'Preparing export...';
+  const candidates = await fetchAllPendingCandidates(matchState.currentDistributor);
+  const itemIds = [...new Set(candidates.map(c=>c.item_id))];
+  let itemsData = [];
+  for(let i=0; i<itemIds.length; i+=500){
+    const chunk = itemIds.slice(i, i+500);
+    const { data } = await sb.from('items').select('id, item_name, pack_size, code').in('id', chunk);
+    if(data) itemsData = itemsData.concat(data);
+  }
+  const itemById = Object.fromEntries(itemsData.map(i=>[i.id, i]));
+
+  const rows = candidates.map(c=>{
+    const item = itemById[c.item_id] || {};
+    return {
+      'candidate_id': c.id,
+      'item_id': c.item_id,
+      'Item Name': item.item_name || '',
+      'Pack Size': item.pack_size || '',
+      'Item Code': item.code || '',
+      'Candidate Code': c.candidate_code,
+      'Candidate Name': c.candidate_name,
+      'Candidate Pack': c.candidate_pack,
+      'MRP': c.candidate_mrp,
+      'Stock': c.candidate_stock,
+      'Match %': c.score,
+      'Decision (write CONFIRM or NO MATCH)': '',
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!autofilter'] = { ref: ws['!ref'] };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Matches');
+  const distName = matchState.distributors.find(d=>d.id===matchState.currentDistributor)?.name || 'distributor';
+  XLSX.writeFile(wb, `Match_Review_${distName}_${new Date().toISOString().slice(0,10)}.xlsx`);
+  btn.disabled = false; btn.textContent = 'Download all as Excel';
+}
+
+async function uploadDecisionsFile(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    const wb = XLSX.read(evt.target.result, {type:'array'});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet);
+
+    const decisionKey = Object.keys(rows[0]||{}).find(k=>k.toLowerCase().startsWith('decision')) || 'Decision (write CONFIRM or NO MATCH)';
+
+    const confirmed = rows.filter(r => String(r[decisionKey]||'').trim().toUpperCase() === 'CONFIRM');
+    const noMatchItemIds = new Set(
+      rows.filter(r => String(r[decisionKey]||'').trim().toUpperCase().includes('NO MATCH')).map(r=>r.item_id)
+    );
+
+    let confirmedCount = 0, rejectedCount = 0;
+    for(const r of confirmed){
+      await sb.from('item_distributor_map').upsert({
+        item_id: r.item_id,
+        distributor_id: matchState.currentDistributor,
+        distributor_item_code: r['Candidate Code'],
+        distributor_item_name: r['Candidate Name'],
+      }, { onConflict: 'item_id,distributor_id' });
+      await sb.from('distributor_inventory').insert({
+        distributor_id: matchState.currentDistributor,
+        item_id: r.item_id,
+        quantity_available: r['Stock'],
+        price: r['MRP'],
+      });
+      await sb.from('distributor_match_candidates').update({ status: 'confirmed' }).eq('id', r.candidate_id);
+      confirmedCount++;
+    }
+    // reject all remaining pending candidates for confirmed or no-match items
+    const resolvedItemIds = [...new Set([...confirmed.map(r=>r.item_id), ...noMatchItemIds])];
+    for(let i=0; i<resolvedItemIds.length; i+=200){
+      const chunk = resolvedItemIds.slice(i, i+200);
+      await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+        .eq('distributor_id', matchState.currentDistributor)
+        .eq('status', 'pending')
+        .in('item_id', chunk);
+    }
+    rejectedCount = noMatchItemIds.size;
+
+    alert(`Applied: ${confirmedCount} confirmed, ${rejectedCount} marked no-match. Reloading list...`);
+    await loadMatchBatch();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+async function loadMatchBatch(){
+  matchState.loading = true;
+  document.getElementById('matchArea').innerHTML = `<div class="card empty-state">Loading candidates...</div>`;
+
+  const { count } = await sb.from('distributor_match_candidates')
+    .select('item_id', { count: 'exact', head: true })
+    .eq('distributor_id', matchState.currentDistributor)
+    .eq('status', 'pending');
+  matchState.totalPending = count || 0;
+
+  const { data } = await sb.from('distributor_match_candidates')
+    .select('*')
+    .eq('distributor_id', matchState.currentDistributor)
+    .eq('status', 'pending')
+    .order('item_id')
+    .order('score', { ascending: false })
+    .limit(60); // ~20 items worth of candidates (up to 3 each)
+
+  if(!data || !data.length){
+    matchState.currentBatch = [];
+    renderMatchArea();
+    matchState.loading = false;
+    return;
+  }
+
+  const itemIds = [...new Set(data.map(d=>d.item_id))];
+  const { data: itemsData } = await sb.from('items').select('id, item_name, pack_size, code').in('id', itemIds);
+  const itemById = Object.fromEntries((itemsData||[]).map(i=>[i.id, i]));
+
+  const grouped = {};
+  data.forEach(c=>{
+    if(!grouped[c.item_id]) grouped[c.item_id] = { item: itemById[c.item_id], candidates: [] };
+    grouped[c.item_id].candidates.push(c);
+  });
+  matchState.currentBatch = Object.values(grouped);
+  matchState.loading = false;
+  renderMatchArea();
+}
+
+function renderMatchArea(){
+  const el = document.getElementById('matchArea');
+  if(!matchState.currentDistributor){ el.innerHTML=''; return; }
+  if(!matchState.currentBatch.length){
+    el.innerHTML = `<div class="card empty-state">No pending candidates left for this distributor — all reviewed, or none uploaded yet.</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="card" style="padding:14px 22px;">
+      <strong>${matchState.totalPending}</strong> items awaiting review for this distributor.
+    </div>
+    ${matchState.currentBatch.map(group => matchItemHTML(group)).join('')}
+  `;
+  document.querySelectorAll('[data-confirm-candidate]').forEach(btn=>{
+    btn.addEventListener('click', ()=>confirmMatch(btn.dataset.confirmCandidate, btn.dataset.itemId));
+  });
+  document.querySelectorAll('[data-reject-item]').forEach(btn=>{
+    btn.addEventListener('click', ()=>rejectItem(btn.dataset.rejectItem));
+  });
+}
+
+function matchItemHTML(group){
+  const item = group.item;
+  if(!item) return '';
+  return `
+    <div class="item-row">
+      <div class="item-head">
+        <div><span class="item-name">${escapeHtml(item.item_name)}</span> <span class="item-meta">${escapeHtml(item.pack_size||'')} · ${escapeHtml(item.code)}</span></div>
+        <button class="btn btn-ghost" style="padding:6px 12px; font-size:12.5px;" data-reject-item="${item.id}">No match — skip</button>
+      </div>
+      <div class="ladder">
+        ${group.candidates.map(c=>`
+          <div class="ladder-item">
+            <div style="flex:1;">
+              <div class="ladder-dist">${escapeHtml(c.candidate_name)} <span class="mono" style="color:var(--muted); font-weight:400;">${escapeHtml(c.candidate_pack||'')}</span></div>
+              <div class="ladder-stats">code ${escapeHtml(c.candidate_code)} · MRP ₹${c.candidate_mrp||'-'} · stock ${c.candidate_stock??'-'} · match ${c.score}%</div>
+            </div>
+            <button class="btn btn-primary" style="padding:7px 14px; font-size:12.5px;" data-confirm-candidate="${c.id}" data-item-id="${item.id}">Confirm match</button>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function confirmMatch(candidateId, itemId){
+  const candidate = matchState.currentBatch.flatMap(g=>g.candidates).find(c=>c.id===candidateId);
+  if(!candidate) return;
+
+  await sb.from('item_distributor_map').upsert({
+    item_id: itemId,
+    distributor_id: matchState.currentDistributor,
+    distributor_item_code: candidate.candidate_code,
+    distributor_item_name: candidate.candidate_name,
+  }, { onConflict: 'item_id,distributor_id' });
+
+  await sb.from('distributor_inventory').insert({
+    distributor_id: matchState.currentDistributor,
+    item_id: itemId,
+    quantity_available: candidate.candidate_stock,
+    price: candidate.candidate_mrp,
+  });
+
+  await sb.from('distributor_match_candidates').update({ status: 'confirmed' }).eq('id', candidateId);
+  await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+    .eq('item_id', itemId).eq('distributor_id', matchState.currentDistributor).eq('status', 'pending');
+
+  matchState.currentBatch = matchState.currentBatch.filter(g => g.item.id !== itemId);
+  matchState.totalPending = Math.max(0, matchState.totalPending - 1);
+  if(matchState.currentBatch.length < 5) await loadMatchBatch();
+  else renderMatchArea();
+}
+
+async function rejectItem(itemId){
+  await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+    .eq('item_id', itemId).eq('distributor_id', matchState.currentDistributor).eq('status', 'pending');
+  matchState.currentBatch = matchState.currentBatch.filter(g => g.item.id !== itemId);
+  matchState.totalPending = Math.max(0, matchState.totalPending - 1);
+  if(matchState.currentBatch.length < 5) await loadMatchBatch();
+  else renderMatchArea();
+}
+
+// ============================================================
+// ADMIN TAB
+// ============================================================
+function adminTabHTML(){
+  return `
+    <div class="grid-2">
+      <div class="card">
+        <h2>Add warehouse</h2>
+        <p class="hint">Adds a new warehouse. It'll appear in the warehouse selector immediately.</p>
+        <form id="addWarehouseForm">
+          <div class="field"><label>Warehouse name</label><input type="text" id="newWhName" required></div>
+          <div class="field"><label>Location (optional)</label><input type="text" id="newWhLocation"></div>
+          <button class="btn btn-primary" type="submit">Add warehouse</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Add distributor</h2>
+        <p class="hint">New distributors won't appear in suggestions until they have purchase history — but they're now available to select manually.</p>
+        <form id="addDistributorForm">
+          <div class="field"><label>Distributor name</label><input type="text" id="newDistName" required></div>
+          <div class="field"><label>Phone (optional)</label><input type="text" id="newDistPhone"></div>
+          <div class="field">
+            <label>Serves warehouse</label>
+            <select id="newDistWarehouse">
+              ${state.warehouses.map(w=>`<option value="${w.id}">${w.name}</option>`).join('')}
+            </select>
+          </div>
+          <button class="btn btn-primary" type="submit">Add distributor</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Warehouses</h2>
+      <ul class="admin-list">
+        ${state.warehouses.map(w=>`<li><span>${escapeHtml(w.name)}</span><span class="mono" style="color:var(--muted); font-size:12px;">${w.id.slice(0,8)}</span></li>`).join('')}
+      </ul>
+    </div>
+  `;
+}
+
+async function handleAddWarehouse(e){
+  e.preventDefault();
+  const name = document.getElementById('newWhName').value.trim();
+  const location = document.getElementById('newWhLocation').value.trim();
+  if(!name) return;
+  const { error } = await sb.from('warehouses').insert({ name, location });
+  if(error){ alert('Could not add warehouse: ' + error.message); return; }
+  await loadWarehouses();
+  renderMain();
+  state.activeTab = 'admin';
+  renderTabContent();
+}
+
+async function handleAddDistributor(e){
+  e.preventDefault();
+  const name = document.getElementById('newDistName').value.trim();
+  const phone = document.getElementById('newDistPhone').value.trim();
+  const warehouseId = document.getElementById('newDistWarehouse').value;
+  if(!name) return;
+  const { data, error } = await sb.from('distributors').insert({ name, phone }).select().single();
+  if(error){ alert('Could not add distributor: ' + error.message); return; }
+  await sb.from('distributor_warehouses').insert({ distributor_id: data.id, warehouse_id: warehouseId });
+  alert('Distributor added.');
+  e.target.reset();
+}
+
+// ============================================================
+// UTIL
+// ============================================================
+function escapeHtml(str){
+  if(str === null || str === undefined) return '';
+  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ============================================================
+// INIT — check existing session
+// ============================================================
+(async function init(){
+  const { data } = await sb.auth.getSession();
+  if(data.session){
+    state.session = data.session;
+    await loadWarehouses();
+  }
+  render();
+})();
+</script>
+</body>
+</html>
