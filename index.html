@@ -739,14 +739,22 @@ async function handleDirectMapUpload(e){
     }
     const codeToId = Object.fromEntries(itemsData.map(i=>[i.code, i.id]));
 
-    const mapped = rows.map(r=>({
+    const mappedRaw = rows.map(r=>({
       item_id: codeToId[String(r[codeCol]).trim()],
       distributor_id: distributorId,
       distributor_item_code: distCodeCol ? String(r[distCodeCol]) : null,
       distributor_item_name: distNameCol ? String(r[distNameCol]) : null,
     })).filter(r=>r.item_id);
 
-    const unmatchedCount = rows.length - mapped.length;
+    const unmatchedCount = rows.length - mappedRaw.length;
+
+    // dedupe by item_id — keep the last occurrence if the same item appears
+    // more than once in the file (Postgres can't apply two updates to the
+    // same row in one batch)
+    const dedupeMap = new Map();
+    mappedRaw.forEach(r => dedupeMap.set(r.item_id, r));
+    const mapped = Array.from(dedupeMap.values());
+    const duplicateCount = mappedRaw.length - mapped.length;
 
     // check how many of these already have a mapping for this distributor
     const mappedItemIds = mapped.map(m=>m.item_id);
@@ -787,7 +795,7 @@ async function handleDirectMapUpload(e){
       return;
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}${duplicateCount ? ` ${duplicateCount} duplicate rows (same item appearing twice in the file) were collapsed to one.` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
     e.target.value = '';
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
