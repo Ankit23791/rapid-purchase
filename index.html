@@ -671,13 +671,21 @@ async function handleStockUpload(e){
     }
 
     let inserted = 0;
+    let lastError = null;
     for(let i=0; i<toInsert.length; i+=500){
       const chunk = toInsert.slice(i, i+500);
       const { error } = await sb.from('distributor_inventory').insert(chunk);
       if(!error) inserted += chunk.length;
+      else lastError = error;
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — stock updated for ${inserted} mapped items.${unmapped ? ` ${unmapped} rows were skipped (not yet mapped for this distributor — use the mapping tool above first, or the catalog matcher below).` : ''}</p>`;
+    if(inserted === 0 && lastError){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Upload failed — nothing was saved. Error: ${escapeHtml(lastError.message)}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — stock updated for ${inserted} mapped items.${unmapped ? ` ${unmapped} rows were skipped (not yet mapped for this distributor — use the mapping tool above first, or the catalog matcher below).` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
     e.target.value = '';
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
@@ -765,13 +773,21 @@ async function handleDirectMapUpload(e){
     }
 
     let inserted = 0;
+    let lastError = null;
     for(let i=0; i<mapped.length; i+=500){
       const chunk = mapped.slice(i, i+500);
       const { error } = await sb.from('item_distributor_map').upsert(chunk, { onConflict: 'item_id,distributor_id' });
       if(!error) inserted += chunk.length;
+      else lastError = error;
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}</p>`;
+    if(inserted === 0 && lastError){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Upload failed — nothing was saved. Error: ${escapeHtml(lastError.message)}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
     e.target.value = '';
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
