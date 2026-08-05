@@ -589,9 +589,27 @@ function initRepeatsTab(){
 
 function downloadSampleOrderSheetFormat(){
   const rows = [
-    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited', 'Qty': 2 },
-    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited', 'Qty': 5 },
-    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Distributor Name order place to': 'Neelkanth Pharma Logistics Private Limited', 'Qty': 3 },
+    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Current Stock(loose)': 4, 'Current Stock(strip)': 1,
+      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited', 'Qty': 2,
+      'Last Order Date': '2026-08-01', 'Order to place': 3,
+      'Last 7 days Sale': 4, 'Last 15 days Sale': 11, 'Last 30 days Sale': 14, 'Last 45 days Sale': 30,
+      'Last 60 days Sale': 43, 'Last 90 Days': 70, 'Last 120 Days': 89, 'Last 180': 112,
+      'Unique Cust (7days)': 4, 'Unique Cust(15 days)': 19, 'Unique Cust(45 days)': 26, 'Unique Cust(60 days)': 39,
+      'unique Cust(90 days)': 39, 'No of Bills(30 d)': 16, 'No of Bills(60 d)': 35, 'No of Bills(120 d)': 71 },
+    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Current Stock(loose)': 0, 'Current Stock(strip)': 0,
+      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited', 'Qty': 5,
+      'Last Order Date': '2026-08-02', 'Order to place': 5,
+      'Last 7 days Sale': 8, 'Last 15 days Sale': 20, 'Last 30 days Sale': 40, 'Last 45 days Sale': 55,
+      'Last 60 days Sale': 70, 'Last 90 Days': 100, 'Last 120 Days': 130, 'Last 180': 180,
+      'Unique Cust (7days)': 7, 'Unique Cust(15 days)': 15, 'Unique Cust(45 days)': 30, 'Unique Cust(60 days)': 40,
+      'unique Cust(90 days)': 50, 'No of Bills(30 d)': 25, 'No of Bills(60 d)': 45, 'No of Bills(120 d)': 90 },
+    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Current Stock(loose)': 2, 'Current Stock(strip)': 0,
+      'Type of Medicine': 'Average', 'Distributor Name order place to': 'Neelkanth Pharma Logistics Private Limited', 'Qty': 3,
+      'Last Order Date': '2026-08-03', 'Order to place': 3,
+      'Last 7 days Sale': 1, 'Last 15 days Sale': 3, 'Last 30 days Sale': 5, 'Last 45 days Sale': 8,
+      'Last 60 days Sale': 10, 'Last 90 Days': 15, 'Last 120 Days': 20, 'Last 180': 28,
+      'Unique Cust (7days)': 1, 'Unique Cust(15 days)': 3, 'Unique Cust(45 days)': 6, 'Unique Cust(60 days)': 8,
+      'unique Cust(90 days)': 10, 'No of Bills(30 d)': 4, 'No of Bills(60 d)': 8, 'No of Bills(120 d)': 15 },
   ];
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
