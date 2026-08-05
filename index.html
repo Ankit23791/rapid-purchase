@@ -239,6 +239,7 @@ function renderMain(){
     </div>
     <div class="tabs">
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
+      <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
       <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
       <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>
     </div>
@@ -263,6 +264,7 @@ function renderMain(){
 function renderTabContent(){
   const el = document.getElementById('tabContent');
   if(state.activeTab === 'order') el.innerHTML = orderTabHTML();
+  else if(state.activeTab === 'repeats'){ el.innerHTML = repeatsTabHTML(); initRepeatsTab(); }
   else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
   else el.innerHTML = adminTabHTML();
   attachTabHandlers();
@@ -469,6 +471,7 @@ async function handleMatch(){
         state.suggestions[s.item_id].push(s);
       });
     }
+    logOrderRun(rows).catch(()=>{}); // fire-and-forget, don't block UI on this
   }
 
   state.loadingOrder = false;
@@ -515,9 +518,191 @@ function exportExcel(){
   XLSX.writeFile(wb, `RapidSurge_Order_${whName}_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
+async function logOrderRun(rows){
+  const matchedRows = rows.filter(r=>r.status==='matched');
+  if(!matchedRows.length) return;
+
+  const { data: run, error: runErr } = await sb.from('order_runs')
+    .insert({ warehouse_id: state.currentWarehouse })
+    .select().single();
+  if(runErr || !run) return;
+
+  const items = matchedRows.map(r=>{
+    const sugg = state.suggestions[r.item.id] || [];
+    const chosenId = state.chosen[r.item.id];
+    const topDistributor = sugg.find(s=>s.distributor_id===chosenId) || sugg[0];
+    return {
+      order_run_id: run.id,
+      item_id: r.item.id,
+      qty: r.qty,
+      distributor_id: topDistributor ? topDistributor.distributor_id : null,
+    };
+  });
+  await sb.from('order_run_items').insert(items);
+}
+
 // ============================================================
-// MATCH ITEMS TAB — human-reviewed distributor catalog matching
+// REPEAT ORDERS TAB
 // ============================================================
+function repeatsTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload order sheet</h2>
+      <p class="hint">For order sheets from your own export (item name, pack size, distributor ordered to, qty, last order date). Groups items by date into order runs — same repeat-order logic as orders placed live in the app.</p>
+      <label>Warehouse</label>
+      <select id="orderSheetWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload order sheet
+          <input type="file" id="orderSheetInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>, <span class="mono">last order date</span>.</p>
+      <div id="orderSheetResult"></div>
+    </div>
+    <div class="card">
+      <h2>Repeat orders</h2>
+      <p class="hint">Items ordered on 2+ different days recently for the selected warehouse. Cross-checked against purchase history to guess why it's repeating.</p>
+    </div>
+    <div id="repeatsArea"></div>
+  `;
+}
+
+function initRepeatsTab(){
+  const input = document.getElementById('orderSheetInput');
+  if(input) input.addEventListener('change', handleOrderSheetUpload);
+  loadRepeats();
+}
+
+async function handleOrderSheetUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('orderSheetWarehouseSelect').value;
+  const resultEl = document.getElementById('orderSheetResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...keywords) => cols.find(c => keywords.every(k => c.toLowerCase().includes(k)));
+    const itemCol = find('item', 'name') || find('item');
+    const packCol = find('pack');
+    const distCol = find('distributor');
+    const qtyCol = cols.find(c => c.toLowerCase().trim() === 'qty' || c.toLowerCase().includes('qty') && !c.toLowerCase().includes('place'));
+    const dateCol = find('last', 'order', 'date') || find('order', 'date');
+
+    if(!itemCol || !qtyCol || !dateCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+
+    // fetch reference data once
+    const { data: itemsData } = await sb.from('items').select('id, item_name, pack_size');
+    const { data: distData } = await sb.from('distributors').select('id, name');
+    const { data: aliasData } = await sb.from('distributor_aliases').select('alias, distributor_id');
+
+    const nameToItems = {};
+    (itemsData||[]).forEach(i=>{
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    const distByName = Object.fromEntries((distData||[]).map(d=>[d.name.trim().toLowerCase(), d.id]));
+    const distByAlias = Object.fromEntries((aliasData||[]).map(a=>[a.alias.trim().toLowerCase(), a.distributor_id]));
+
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const packMatch = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return packMatch ? packMatch.id : null;
+      }
+      return null;
+    }
+    function resolveDistributor(name){
+      if(!name) return null;
+      const key = String(name).trim().toLowerCase();
+      return distByName[key] || distByAlias[key] || null;
+    }
+
+    // group rows by date
+    const byDate = {};
+    let itemUnmatched = 0, distUnmatched = 0;
+    rows.forEach(r=>{
+      const dateRaw = r[dateCol];
+      let dateStr;
+      if(dateRaw instanceof Date) dateStr = dateRaw.toISOString().slice(0,10);
+      else {
+        const parsed = new Date(dateRaw);
+        dateStr = isNaN(parsed) ? String(dateRaw) : parsed.toISOString().slice(0,10);
+      }
+      const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
+      if(!itemId){ itemUnmatched++; return; }
+      const distId = distCol ? resolveDistributor(r[distCol]) : null;
+      if(distCol && r[distCol] && !distId) distUnmatched++;
+      const qty = parseInt(r[qtyCol]) || 0;
+
+      if(!byDate[dateStr]) byDate[dateStr] = [];
+      byDate[dateStr].push({ item_id: itemId, qty, distributor_id: distId });
+    });
+
+    let runsCreated = 0, itemsLogged = 0;
+    for(const [dateStr, items] of Object.entries(byDate)){
+      const { data: run, error: runErr } = await sb.from('order_runs')
+        .insert({ warehouse_id: warehouseId, run_at: `${dateStr}T12:00:00Z` })
+        .select().single();
+      if(runErr || !run) continue;
+      runsCreated++;
+      const runItems = items.map(i => ({ order_run_id: run.id, item_id: i.item_id, qty: i.qty, distributor_id: i.distributor_id }));
+      const { error: itemsErr } = await sb.from('order_run_items').insert(runItems);
+      if(!itemsErr) itemsLogged += runItems.length;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — logged ${itemsLogged} items across ${runsCreated} day(s).${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}</p>`;
+    e.target.value = '';
+    loadRepeats();
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function loadRepeats(){
+  const el = document.getElementById('repeatsArea');
+  el.innerHTML = `<div class="card empty-state">Loading...</div>`;
+  const { data, error } = await sb.rpc('get_repeat_orders', { p_warehouse_id: state.currentWarehouse, p_days_back: 14 });
+  if(error || !data || !data.length){
+    el.innerHTML = `<div class="card empty-state">No repeat orders found in the last 14 days for this warehouse — either everything's flowing smoothly, or no order runs have been logged yet (order runs are saved automatically each time you click "Find distributors" in New Order).</div>`;
+    return;
+  }
+  el.innerHTML = data.map(r=>{
+    const isProblem = r.likely_reason.includes('Not delivered');
+    return `
+      <div class="item-row" style="border-color:${isProblem ? 'var(--red)' : 'var(--border)'};">
+        <div class="item-head">
+          <div><span class="item-name">${escapeHtml(r.item_name)}</span> <span class="item-meta">${escapeHtml(r.pack_size||'')} · ${escapeHtml(r.code)}</span></div>
+          <span class="qty-badge">Ordered on ${r.distinct_days} days</span>
+        </div>
+        <p class="no-history" style="color:${isProblem ? 'var(--red)' : 'var(--green)'}; font-style:normal; font-weight:600;">${escapeHtml(r.likely_reason)}</p>
+        <p class="no-history">Dates: ${r.run_dates.join(', ')} · Latest qty ordered: ${r.latest_qty}</p>
+      </div>
+    `;
+  }).join('');
+}
 let matchState = {
   distributors: [],
   currentDistributor: null,
