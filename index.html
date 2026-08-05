@@ -330,13 +330,15 @@ function itemRowHTML(row){
   const sugg = state.suggestions[item.id] || [];
   const ladder = sugg.length ? `
     <div class="ladder">
-      ${sugg.map((s,i)=>`
+      ${sugg.map((s,i)=>{
+        const inStock = s.live_stock !== null && s.live_stock !== undefined && s.live_stock > 0;
+        return `
         <div class="ladder-item ${i===0?'top':'rank'+(i+1)}">
           <div class="rank-chip">${i+1}</div>
-          <div class="ladder-dist">${escapeHtml(s.distributor_name)}</div>
-          <div class="ladder-stats">last: ${s.last_purchased} · margin ${s.avg_margin_pct}%</div>
+          <div class="ladder-dist">${escapeHtml(s.distributor_name)} ${inStock ? `<span class="badge-warn" style="background:#E8F4EE; color:var(--green); border-color:#BFE3CE;">In stock: ${s.live_stock}</span>` : ''}</div>
+          <div class="ladder-stats">${s.last_purchased ? `last: ${s.last_purchased} · ` : (inStock ? 'no purchase history yet · ' : '')}margin ${s.avg_margin_pct ?? '-'}%${inStock && s.live_price ? ` · MRP ₹${s.live_price}` : ''}</div>
         </div>
-      `).join('')}
+      `}).join('')}
     </div>
     <select class="choose" data-item="${item.id}">
       <option value="">Choose distributor for this item...</option>
