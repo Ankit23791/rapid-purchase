@@ -281,6 +281,7 @@ function orderTabHTML(){
           Upload file
           <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
         </label>
+        <button class="btn btn-ghost" id="downloadSampleOrderBtn">Download sample format</button>
         <button class="btn btn-ghost" id="exportBtn" style="display:${state.parsedRows.length ? 'inline-flex' : 'none'};">Download Excel</button>
       </div>
     </div>
@@ -363,6 +364,12 @@ function attachTabHandlers(){
 
   const exportBtn = document.getElementById('exportBtn');
   if(exportBtn) exportBtn.addEventListener('click', exportExcel);
+
+  const downloadSampleOrderBtn = document.getElementById('downloadSampleOrderBtn');
+  if(downloadSampleOrderBtn) downloadSampleOrderBtn.addEventListener('click', downloadSampleOrderFormat);
+
+  const downloadSampleMappingBtn = document.getElementById('downloadSampleMappingBtn');
+  if(downloadSampleMappingBtn) downloadSampleMappingBtn.addEventListener('click', downloadSampleMappingFormat);
 
   document.querySelectorAll('select.choose').forEach(sel=>{
     sel.addEventListener('change', (e)=>{
@@ -529,6 +536,7 @@ function matchTabHTML(){
           Upload mapping file
           <input type="file" id="directMapFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
         </label>
+        <button class="btn btn-ghost" id="downloadSampleMappingBtn">Download sample format</button>
       </div>
       <p class="hint" style="margin:10px 0 0;">Expected columns (name doesn't have to match exactly, just needs to contain these words): a column with <span class="mono">code</span> for your item code, and columns for the distributor's own code and name.</p>
       <div id="directMapResult"></div>
@@ -967,6 +975,34 @@ async function handleAddDistributor(e){
   await sb.from('distributor_warehouses').insert({ distributor_id: data.id, warehouse_id: warehouseId });
   alert('Distributor added.');
   e.target.reset();
+}
+
+// ============================================================
+// SAMPLE FORMAT DOWNLOADS
+// ============================================================
+function downloadSampleOrderFormat(){
+  const rows = [
+    { 'Item': 'Acitrom 1 Tablet', 'Pack Size': '30 Tablet', 'Qty': 20 },
+    { 'Item': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Qty': 10 },
+    { 'Item': 'M00010K', 'Pack Size': '', 'Qty': 10 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Order');
+  XLSX.writeFile(wb, 'sample_order_format.xlsx');
+}
+
+function downloadSampleMappingFormat(){
+  const rows = [
+    { 'Rio Code': 'M0000Z2', 'Rio Medicine Name': 'Acitrom 1 Tablet', 'Rio Pack Size': '30 Tablet',
+      'Distributor Code': '4330', 'Distributor Medicine Name': 'ACITROM 1MG', 'Distributor Pack Size': '30S' },
+    { 'Rio Code': 'M0008HC', 'Rio Medicine Name': 'Pan D Capsule', 'Rio Pack Size': '15 Capsules',
+      'Distributor Code': '8869', 'Distributor Medicine Name': 'PAN D CAP', 'Distributor Pack Size': '15S' },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Mapping');
+  XLSX.writeFile(wb, 'sample_mapping_format.xlsx');
 }
 
 // ============================================================
