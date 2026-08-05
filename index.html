@@ -527,6 +527,21 @@ let matchState = {
 function matchTabHTML(){
   return `
     <div class="card">
+      <h2>Upload live stock &amp; price</h2>
+      <p class="hint">For distributors already mapped (like Jeplus, Acorn) — upload their current stock/price file. Only items with an existing mapping will update; anything not yet mapped is skipped and reported, not guessed at.</p>
+      <label>Distributor</label>
+      <select id="stockDistributorSelect" style="max-width:360px; margin-bottom:12px;"></select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload stock file
+          <input type="file" id="stockFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: the distributor's own item <span class="mono">code</span>, a <span class="mono">stock</span>/quantity column, and an <span class="mono">MRP</span>/price column.</p>
+      <div id="stockUploadResult"></div>
+    </div>
+
+    <div class="card">
       <h2>Upload a ready-made mapping</h2>
       <p class="hint">If a distributor has already shared their own item-code mapping (like Jeplus or Acorn did) — a file with <strong>your item code</strong> alongside their code/name — upload it directly here. No review needed, since it's matched by exact code, not guesswork.</p>
       <label>Distributor</label>
@@ -563,6 +578,14 @@ async function loadMatchDistributors(){
   const { data } = await sb.from('distributors').select('id, name').order('name');
   matchState.distributors = data || [];
 
+  const stockSel = document.getElementById('stockDistributorSelect');
+  if(stockSel){
+    stockSel.innerHTML = `<option value="">Select a distributor...</option>` +
+      matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  }
+  const stockFileInput = document.getElementById('stockFileInput');
+  if(stockFileInput) stockFileInput.addEventListener('change', handleStockUpload);
+
   const directSel = document.getElementById('directMapDistributorSelect');
   if(directSel){
     directSel.innerHTML = `<option value="">Select a distributor...</option>` +
@@ -586,6 +609,77 @@ async function loadMatchDistributors(){
   });
   document.getElementById('exportCandidatesBtn').addEventListener('click', exportCandidatesToExcel);
   document.getElementById('uploadDecisionsInput').addEventListener('change', uploadDecisionsFile);
+}
+
+async function handleStockUpload(e){
+  const file = e.target.files[0];
+  const distributorId = document.getElementById('stockDistributorSelect').value;
+  const resultEl = document.getElementById('stockUploadResult');
+  if(!file) return;
+  if(!distributorId){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please select a distributor first.</p>`;
+    e.target.value = '';
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const allCols = Object.keys(rows[0]);
+    const codeCol = allCols.find(k => k.toLowerCase().includes('code'));
+    const stockCol = allCols.find(k => k.toLowerCase().includes('stock') || k.toLowerCase().includes('qty') || k.toLowerCase().includes('available'));
+    const priceCol = allCols.find(k => k.toLowerCase().includes('mrp') || k.toLowerCase().includes('price'));
+
+    if(!codeCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a code column. Columns found: ${allCols.join(', ')}</p>`;
+      return;
+    }
+
+    // look up existing mapping for this distributor by their own code
+    const { data: mapData } = await sb.from('item_distributor_map')
+      .select('item_id, distributor_item_code')
+      .eq('distributor_id', distributorId);
+    const codeToItemId = Object.fromEntries((mapData||[]).map(m=>[String(m.distributor_item_code).trim(), m.item_id]));
+
+    const toInsert = [];
+    let unmapped = 0;
+    for(const r of rows){
+      const code = String(r[codeCol]).trim();
+      const itemId = codeToItemId[code];
+      if(!itemId){ unmapped++; continue; }
+      toInsert.push({
+        distributor_id: distributorId,
+        item_id: itemId,
+        quantity_available: stockCol ? parseInt(r[stockCol]) || 0 : null,
+        price: priceCol ? parseFloat(r[priceCol]) || null : null,
+      });
+    }
+
+    let inserted = 0;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('distributor_inventory').insert(chunk);
+      if(!error) inserted += chunk.length;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — stock updated for ${inserted} mapped items.${unmapped ? ` ${unmapped} rows were skipped (not yet mapped for this distributor — use the mapping tool above first, or the catalog matcher below).` : ''}</p>`;
+    e.target.value = '';
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
 }
 
 async function handleDirectMapUpload(e){
