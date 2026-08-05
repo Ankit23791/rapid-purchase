@@ -8,6 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <style>
   :root{
     --ink:#1C2B2B;
@@ -143,6 +144,7 @@
 const SUPABASE_URL = "https://ffsobagjqcwqgmoyphlu.supabase.co";
 const SUPABASE_KEY = "sb_publishable_VGM9tD_t4FnIpEx-anuN8g_3DpR3l50";
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
 
 let state = {
   session: null,
@@ -529,6 +531,19 @@ let matchState = {
 function matchTabHTML(){
   return `
     <div class="card">
+      <h2>Convert stock PDF to Excel</h2>
+      <p class="hint">For distributors who send stock as a PDF (Health &amp; Wellness, Shri Radhey, Guru Ji, Sharma Agency, etc.) instead of Excel. Upload the PDF, get back a clean 3-column Excel: Medicine Name, Pack Size, Current Stock — ready to feed into the tools below.</p>
+      <p class="hint" style="color:var(--amber);">Since every distributor's PDF layout differs, this uses a general pattern-matching approach, not a per-distributor template. Spot-check the output before using it — if a particular distributor's format parses badly, share a sample and it can be tuned.</p>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload PDF stock report
+          <input type="file" id="pdfStockInput" accept=".pdf" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <div id="pdfStockResult"></div>
+    </div>
+
+    <div class="card">
       <h2>Upload live stock &amp; price</h2>
       <p class="hint">For distributors already mapped (like Jeplus, Acorn) — upload their current stock/price file. Only items with an existing mapping will update; anything not yet mapped is skipped and reported, not guessed at.</p>
       <label>Distributor</label>
@@ -577,6 +592,9 @@ function matchTabHTML(){
 }
 
 async function loadMatchDistributors(){
+  const pdfStockInput = document.getElementById('pdfStockInput');
+  if(pdfStockInput) pdfStockInput.addEventListener('change', handlePdfStockUpload);
+
   const { data } = await sb.from('distributors').select('id, name').order('name');
   matchState.distributors = data || [];
 
@@ -611,6 +629,108 @@ async function loadMatchDistributors(){
   });
   document.getElementById('exportCandidatesBtn').addEventListener('click', exportCandidatesToExcel);
   document.getElementById('uploadDecisionsInput').addEventListener('change', uploadDecisionsFile);
+}
+
+// ============================================================
+// PDF STOCK REPORT -> EXCEL CONVERTER
+// ============================================================
+const KNOWN_UNITS = ['pcs','tab','tabs','strp','cap','caps','ml','syp','amp','drop','vial','inj','tube','crea','sch','kit'];
+const SKIP_LINE_PATTERNS = [
+  /total\b/i, /page no/i, /continued/i, /gstin/i, /closing stock/i, /^s\.?no\.?\s/i,
+  /^phone\s*:/i, /end of report/i, /^-{5,}/, /e-mail/i,
+];
+
+function isSkippableLine(line){
+  const trimmed = line.trim();
+  if(!trimmed) return true;
+  return SKIP_LINE_PATTERNS.some(p => p.test(trimmed));
+}
+
+function parsePdfLine(line){
+  // strip a leading serial number, if present
+  let working = line.trim().replace(/^\d+\s+/, '');
+  const tokens = working.split(/\s+/).filter(Boolean);
+  if(tokens.length < 3) return null;
+
+  const last = tokens[tokens.length - 1].toLowerCase().replace(/[^a-z]/g, '');
+  const isUnitLike = KNOWN_UNITS.includes(last) || (last.length <= 5 && /^[a-z]+$/.test(last));
+  if(!isUnitLike) return null;
+
+  const stockToken = tokens[tokens.length - 2];
+  const stockMatch = stockToken.match(/^-?\d+$/);
+  if(!stockMatch) return null;
+  const stock = parseInt(stockToken, 10);
+
+  const remaining = tokens.slice(0, tokens.length - 2);
+  if(remaining.length < 2) return null;
+
+  // pack size: the last remaining token if it looks like a pack (has a digit)
+  const lastRemaining = remaining[remaining.length - 1];
+  const looksLikePack = /\d/.test(lastRemaining);
+  let pack = '', nameTokens = remaining;
+  if(looksLikePack){
+    pack = lastRemaining;
+    nameTokens = remaining.slice(0, remaining.length - 1);
+  }
+  const name = nameTokens.join(' ').trim();
+  if(!name) return null;
+
+  return { name, pack, stock };
+}
+
+async function handlePdfStockUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('pdfStockResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Reading PDF...</p>`;
+
+  try{
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    const rows = [];
+    for(let pageNum = 1; pageNum <= pdf.numPages; pageNum++){
+      const page = await pdf.getPage(pageNum);
+      const content = await page.getTextContent();
+
+      // group text items into lines by y-position
+      const lineMap = new Map();
+      content.items.forEach(item => {
+        const y = Math.round(item.transform[5]);
+        if(!lineMap.has(y)) lineMap.set(y, []);
+        lineMap.get(y).push(item);
+      });
+
+      const sortedYs = Array.from(lineMap.keys()).sort((a,b) => b - a);
+      sortedYs.forEach(y => {
+        const items = lineMap.get(y).sort((a,b) => a.transform[4] - b.transform[4]);
+        const lineText = items.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
+        if(isSkippableLine(lineText)) return;
+        const parsed = parsePdfLine(lineText);
+        if(parsed) rows.push(parsed);
+      });
+    }
+
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't extract any stock rows from this PDF. The layout may be too different from what this parser expects — share a sample and it can be tuned.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const excelRows = rows.map(r => ({ 'Medicine Name': r.name, 'Pack Size': r.pack, 'Current Stock': r.stock }));
+    const ws = XLSX.utils.json_to_sheet(excelRows);
+    ws['!autofilter'] = { ref: ws['!ref'] };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Stock');
+    const outName = file.name.replace(/\.pdf$/i, '') + '_converted.xlsx';
+    XLSX.writeFile(wb, outName);
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — extracted ${rows.length} rows into ${escapeHtml(outName)}. Please spot-check a few rows against the original PDF before using this.</p>`;
+    e.target.value = '';
+  } catch(err){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't read this PDF: ${escapeHtml(err.message)}</p>`;
+    e.target.value = '';
+  }
 }
 
 async function handleStockUpload(e){
