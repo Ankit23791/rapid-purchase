@@ -240,6 +240,7 @@ function renderMain(){
     <div class="tabs">
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
+      <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
       <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>
     </div>
@@ -265,6 +266,7 @@ function renderTabContent(){
   const el = document.getElementById('tabContent');
   if(state.activeTab === 'order') el.innerHTML = orderTabHTML();
   else if(state.activeTab === 'repeats'){ el.innerHTML = repeatsTabHTML(); initRepeatsTab(); }
+  else if(state.activeTab === 'inventory'){ el.innerHTML = inventoryTabHTML(); loadInventoryAnalysis(); }
   else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
   else el.innerHTML = adminTabHTML();
   attachTabHandlers();
@@ -654,6 +656,34 @@ async function handleOrderSheetUpload(e){
       const lc = c.toLowerCase().trim();
       return (lc === 'qty' || lc.includes('qty')) && !lc.includes('place');
     });
+    // Feature 2 columns — all optional, only used if present
+    const stockLooseCol = find('stock', 'loose');
+    const stockStripCol = find('strip');
+    const medTypeCol = cols.find(c => c.toLowerCase().includes('type') && !c.toLowerCase().includes('distributor'));
+    const lastSaleCol = find('last', 'order', 'date') || find('last', 'sale');
+    const salesCols = {
+      sales_7d: cols.find(c=>/7\s*days?\s*sale/i.test(c)),
+      sales_15d: cols.find(c=>/15\s*days?\s*sale/i.test(c)),
+      sales_30d: cols.find(c=>/30\s*days?\s*sale/i.test(c)),
+      sales_45d: cols.find(c=>/45\s*days?\s*sale/i.test(c)),
+      sales_60d: cols.find(c=>/60\s*days?\s*sale/i.test(c)),
+      sales_90d: cols.find(c=>/90\s*days?\s*sale/i.test(c) || /90\s*day/i.test(c)),
+      sales_120d: cols.find(c=>/120\s*days?\s*sale/i.test(c) || /120\s*day/i.test(c)),
+      sales_180d: cols.find(c=>/180/i.test(c) && /sale|day/i.test(c)),
+    };
+    const custCols = {
+      unique_cust_7d: cols.find(c=>/unique.*cust.*7\s*days?/i.test(c)),
+      unique_cust_15d: cols.find(c=>/unique.*cust.*15\s*days?/i.test(c)),
+      unique_cust_45d: cols.find(c=>/unique.*cust.*45\s*days?/i.test(c)),
+      unique_cust_60d: cols.find(c=>/unique.*cust.*60\s*days?/i.test(c)),
+      unique_cust_90d: cols.find(c=>/unique.*cust.*90\s*days?/i.test(c)),
+    };
+    const billsCols = {
+      bills_30d: cols.find(c=>/bills?\(?30/i.test(c)),
+      bills_60d: cols.find(c=>/bills?\(?60/i.test(c)),
+      bills_120d: cols.find(c=>/bills?\(?120/i.test(c)),
+    };
+    const hasInventoryData = !!(stockLooseCol || stockStripCol || medTypeCol);
 
     if(!itemCol || !qtyCol){
       resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
@@ -690,6 +720,8 @@ async function handleOrderSheetUpload(e){
 
     let itemUnmatched = 0, distUnmatched = 0;
     const runItemsToInsert = [];
+    const invSnapshotsToInsert = [];
+    const runAtIso = new Date(dateTimeVal).toISOString();
     rows.forEach(r=>{
       const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
       if(!itemId){ itemUnmatched++; return; }
@@ -697,6 +729,35 @@ async function handleOrderSheetUpload(e){
       if(distCol && r[distCol] && !distId) distUnmatched++;
       const qty = parseInt(r[qtyCol]) || 0;
       runItemsToInsert.push({ item_id: itemId, qty, distributor_id: distId });
+
+      if(hasInventoryData){
+        const numOrNull = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
+        invSnapshotsToInsert.push({
+          item_id: itemId,
+          warehouse_id: warehouseId,
+          snapshot_at: runAtIso,
+          stock_loose: numOrNull(stockLooseCol ? r[stockLooseCol] : null),
+          closing_strip: numOrNull(stockStripCol ? r[stockStripCol] : null),
+          med_type: medTypeCol ? r[medTypeCol] : null,
+          last_sale_date: lastSaleCol && r[lastSaleCol] ? (r[lastSaleCol] instanceof Date ? r[lastSaleCol].toISOString().slice(0,10) : String(r[lastSaleCol])) : null,
+          sales_7d: numOrNull(salesCols.sales_7d ? r[salesCols.sales_7d] : null),
+          sales_15d: numOrNull(salesCols.sales_15d ? r[salesCols.sales_15d] : null),
+          sales_30d: numOrNull(salesCols.sales_30d ? r[salesCols.sales_30d] : null),
+          sales_45d: numOrNull(salesCols.sales_45d ? r[salesCols.sales_45d] : null),
+          sales_60d: numOrNull(salesCols.sales_60d ? r[salesCols.sales_60d] : null),
+          sales_90d: numOrNull(salesCols.sales_90d ? r[salesCols.sales_90d] : null),
+          sales_120d: numOrNull(salesCols.sales_120d ? r[salesCols.sales_120d] : null),
+          sales_180d: numOrNull(salesCols.sales_180d ? r[salesCols.sales_180d] : null),
+          unique_cust_7d: numOrNull(custCols.unique_cust_7d ? r[custCols.unique_cust_7d] : null),
+          unique_cust_15d: numOrNull(custCols.unique_cust_15d ? r[custCols.unique_cust_15d] : null),
+          unique_cust_45d: numOrNull(custCols.unique_cust_45d ? r[custCols.unique_cust_45d] : null),
+          unique_cust_60d: numOrNull(custCols.unique_cust_60d ? r[custCols.unique_cust_60d] : null),
+          unique_cust_90d: numOrNull(custCols.unique_cust_90d ? r[custCols.unique_cust_90d] : null),
+          bills_30d: numOrNull(billsCols.bills_30d ? r[billsCols.bills_30d] : null),
+          bills_60d: numOrNull(billsCols.bills_60d ? r[billsCols.bills_60d] : null),
+          bills_120d: numOrNull(billsCols.bills_120d ? r[billsCols.bills_120d] : null),
+        });
+      }
     });
 
     if(!runItemsToInsert.length){
@@ -705,7 +766,6 @@ async function handleOrderSheetUpload(e){
       return;
     }
 
-    const runAtIso = new Date(dateTimeVal).toISOString();
     const { data: run, error: runErr } = await sb.from('order_runs')
       .insert({ warehouse_id: warehouseId, run_at: runAtIso })
       .select().single();
@@ -720,7 +780,17 @@ async function handleOrderSheetUpload(e){
     const { error: itemsErr } = await sb.from('order_run_items').insert(finalItems);
     const itemsLogged = itemsErr ? 0 : finalItems.length;
 
-    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}</p>`;
+    let invLogged = 0, invErrMsg = '';
+    if(hasInventoryData && invSnapshotsToInsert.length){
+      for(let i=0; i<invSnapshotsToInsert.length; i+=500){
+        const chunk = invSnapshotsToInsert.slice(i, i+500);
+        const { error: invErr } = await sb.from('inventory_snapshots').insert(chunk);
+        if(!invErr) invLogged += chunk.length;
+        else invErrMsg = invErr.message;
+      }
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows for Feature 2 analysis.${invErrMsg ? ` (Some snapshot rows failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>`;
     e.target.value = '';
     loadRepeats();
   };
@@ -759,6 +829,206 @@ let matchState = {
   totalPending: 0,
   loading: false,
 };
+
+// ============================================================
+// INVENTORY ANALYSIS TAB (Feature 2)
+// ============================================================
+function inventoryTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload medicine analysis</h2>
+      <p class="hint">Upload the output of your sales-velocity analysis script (the "Medicine Analysis" sheet) — stored as-is, since it's your validated logic, not recomputed here.</p>
+      <label>Warehouse</label>
+      <select id="analysisWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <label>Snapshot date (when this analysis was run)</label>
+      <input type="date" id="analysisSnapshotDate" style="max-width:200px; margin-bottom:12px;">
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload analysis file
+          <input type="file" id="analysisFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <div id="analysisUploadResult"></div>
+    </div>
+    <div class="card">
+      <h2>Zero stock</h2>
+      <p class="hint">Items currently at zero combined stock (loose + strip), from order sheet uploads in the Repeat Orders tab.</p>
+      <div id="zeroStockArea"></div>
+    </div>
+    <div class="card">
+      <h2>Dead stock review</h2>
+      <p class="hint">Items with no recent sale, sorted by longest since last order — from your latest uploaded analysis.</p>
+      <div id="deadStockArea"></div>
+    </div>
+    <div class="card">
+      <h2>Medicine type breakdown</h2>
+      <div id="typeBreakdownArea"></div>
+    </div>
+  `;
+}
+
+async function loadInventoryAnalysis(){
+  const dateInput = document.getElementById('analysisSnapshotDate');
+  if(dateInput && !dateInput.value) dateInput.value = new Date().toISOString().slice(0,10);
+  const fileInput = document.getElementById('analysisFileInput');
+  if(fileInput) fileInput.addEventListener('change', handleAnalysisUpload);
+
+  const zeroEl = document.getElementById('zeroStockArea');
+  zeroEl.innerHTML = `<p class="no-history">Loading...</p>`;
+  const { data: zeroData } = await sb.rpc('get_zero_stock_status', { p_warehouse_id: state.currentWarehouse });
+  if(!zeroData || !zeroData.length){
+    zeroEl.innerHTML = `<p class="no-history">No inventory snapshots yet for this warehouse — upload an order sheet with stock columns in the Repeat Orders tab first.</p>`;
+  } else {
+    const zeroItems = zeroData.filter(r=>r.currently_zero);
+    zeroEl.innerHTML = !zeroItems.length
+      ? `<p class="no-history" style="color:var(--green);">Nothing currently at zero stock.</p>`
+      : `<table class="summary">
+          <tr><th>Item</th><th>Days at zero</th><th>Zero snapshots</th></tr>
+          ${zeroItems.map(r=>`
+            <tr>
+              <td>${escapeHtml(r.item_name)} <span class="mono" style="color:var(--muted); font-size:12px;">${escapeHtml(r.pack_size||'')}</span></td>
+              <td style="color:var(--red); font-weight:600;">${r.days_at_zero!==null ? r.days_at_zero.toFixed(1) : '-'}</td>
+              <td>${r.total_zero_snapshots} / ${r.total_snapshots}</td>
+            </tr>
+          `).join('')}
+        </table>`;
+  }
+
+  await loadAnalysisSummaries();
+}
+
+async function loadAnalysisSummaries(){
+  const deadEl = document.getElementById('deadStockArea');
+  const typeEl = document.getElementById('typeBreakdownArea');
+  deadEl.innerHTML = `<p class="no-history">Loading...</p>`;
+  typeEl.innerHTML = `<p class="no-history">Loading...</p>`;
+
+  // latest snapshot_date for this warehouse
+  const { data: latestRow } = await sb.from('medicine_analysis_snapshots')
+    .select('snapshot_date').eq('warehouse_id', state.currentWarehouse)
+    .order('snapshot_date', { ascending: false }).limit(1).maybeSingle();
+
+  if(!latestRow){
+    deadEl.innerHTML = `<p class="no-history">No analysis uploaded yet for this warehouse.</p>`;
+    typeEl.innerHTML = `<p class="no-history">No analysis uploaded yet for this warehouse.</p>`;
+    return;
+  }
+
+  const { data: rows } = await sb.from('medicine_analysis_snapshots')
+    .select('*, items(item_name, pack_size)')
+    .eq('warehouse_id', state.currentWarehouse)
+    .eq('snapshot_date', latestRow.snapshot_date);
+
+  const typeCounts = {};
+  (rows||[]).forEach(r => { typeCounts[r.medicine_type] = (typeCounts[r.medicine_type]||0) + 1; });
+  typeEl.innerHTML = `
+    <p class="hint" style="margin-bottom:10px;">From snapshot dated ${latestRow.snapshot_date} (${(rows||[]).length} items).</p>
+    <table class="summary">
+      <tr><th>Type</th><th>Count</th></tr>
+      ${Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]).map(([t,c])=>`<tr><td>${escapeHtml(t||'-')}</td><td>${c}</td></tr>`).join('')}
+    </table>
+  `;
+
+  const dead = (rows||[])
+    .filter(r => ['Dead Stock','No Sale (Slow)','No Sale (Active)'].includes(r.medicine_type))
+    .sort((a,b) => (b.days_since_last_order||0) - (a.days_since_last_order||0))
+    .slice(0, 50);
+  deadEl.innerHTML = !dead.length
+    ? `<p class="no-history">No dead/no-sale items in the latest snapshot.</p>`
+    : `<table class="summary">
+        <tr><th>Item</th><th>Type</th><th>Last order</th><th>Days since</th></tr>
+        ${dead.map(r=>`
+          <tr>
+            <td>${escapeHtml(r.items?.item_name||'')} <span class="mono" style="color:var(--muted); font-size:12px;">${escapeHtml(r.items?.pack_size||'')}</span></td>
+            <td>${escapeHtml(r.medicine_type||'-')}</td>
+            <td>${r.last_order_date||'-'}</td>
+            <td style="color:var(--amber); font-weight:600;">${r.days_since_last_order ?? '-'}</td>
+          </tr>
+        `).join('')}
+      </table>`;
+}
+
+async function handleAnalysisUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('analysisWarehouseSelect').value;
+  const snapshotDate = document.getElementById('analysisSnapshotDate').value;
+  const resultEl = document.getElementById('analysisUploadResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Processing (this may take a moment for large files)...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    const wb = XLSX.read(evt.target.result, {type:'array'});
+    const sheetName = wb.SheetNames.includes('Medicine Analysis') ? 'Medicine Analysis' : wb.SheetNames[0];
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows found in sheet "${escapeHtml(sheetName)}".</p>`;
+      return;
+    }
+
+    const { data: itemsData } = await sb.from('items').select('id, item_name, pack_size');
+    const nameToItems = {};
+    (itemsData||[]).forEach(i=>{
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return m ? m.id : null;
+      }
+      return null;
+    }
+    const num = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
+
+    let unmatched = 0;
+    const toInsert = [];
+    rows.forEach(r=>{
+      const itemId = resolveItem(r['Medicine Name'], r['Pack Size']);
+      if(!itemId){ unmatched++; return; }
+      toInsert.push({
+        warehouse_id: warehouseId, item_id: itemId, snapshot_date: snapshotDate,
+        medicine_type: r['Medicine Type'], stock_logic: r['Stock Logic'], demand_pattern: r['Demand Pattern'],
+        momentum: r['Momentum (15d vs 30d)'],
+        bills_7d: num(r['Total Bills (7d)']), unique_cust_7d: num(r['Unique Customers (7d)']), qty_7d: num(r['Total Qty Sold (7d)']),
+        bills_15d: num(r['Total Bills (15d)']), unique_cust_15d: num(r['Unique Customers (15d)']), qty_15d: num(r['Total Qty Sold (15d)']),
+        bills_30d: num(r['Total Bills (30d)']), days_sold_30d: num(r['Days Sold (30d)']), qty_30d: num(r['Total Qty Sold (30d)']),
+        clean_qty_30d: num(r['Clean Qty Sold (30d)']), outlier_bills: num(r['Outlier Bills']), max_qty_single_bill: num(r['Max Qty Single Bill']),
+        percentile_95: num(r['Percentile 95']),
+        qty_45d: num(r['Total Qty Sold (45d)']), bills_45d: num(r['Total Bills (45d)']), unique_cust_45d: num(r['Unique Customers (45d)']),
+        qty_60d: num(r['Total Qty Sold (60d)']), bills_60d: num(r['Total Bills (60d)']), unique_cust_60d: num(r['Unique Customers (60d)']),
+        qty_90d: num(r['Total Qty Sold (90d)']), bills_90d: num(r['Total Bills (90d)']), unique_cust_90d: num(r['Unique Customers (90d)']),
+        qty_120d: num(r['Total Qty Sold (120d)']), bills_120d: num(r['Total Bills (120d)']), unique_cust_120d: num(r['Unique Customers (120d)']),
+        qty_180d: num(r['Total Qty Sold (180d)']), bills_180d: num(r['Total Bills (180d)']), unique_cust_180d: num(r['Unique Customers (180d)']),
+        last_order_date: r['Last Order Date'] || null,
+        days_since_last_order: num(r['Days Since Last Order']),
+        daily_avg_30d: num(r['Daily Avg (30d)']), avg_per_days_sold: num(r['Avg per Days Sold']), max_daily_sale: num(r['Max Daily Sale']),
+        unique_cust_30d: num(r['Unique Customers (30d)']), avg_visits_per_cust: num(r['Avg Visits/Customer']),
+        avg_cust_per_day: num(r['Avg Customers Per Day']), same_day_customers: num(r['Same Day Customers']),
+        avg_gap_between_sales_d: num(r['Avg Gap Between Sales (d)']),
+        q1: num(r['Q1']), q3: num(r['Q3']), upper_fence_iqr: num(r['Upper Fence IQR']), outlier_verdict: r['Outlier Verdict'],
+        min_stock: num(r['Min Stock']), max_stock: num(r['Max Stock']), reorder_qty: num(r['Reorder Qty']),
+      });
+    });
+
+    let inserted = 0, lastError = null;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('medicine_analysis_snapshots').insert(chunk);
+      if(!error) inserted += chunk.length; else lastError = error;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${lastError && inserted===0 ? 'var(--red)' : 'var(--green)'};">Done — saved ${inserted} rows for ${snapshotDate}.${unmatched ? ` ${unmatched} rows skipped (item not matched).` : ''}${lastError ? ` Error on some rows: ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+    loadAnalysisSummaries();
+  };
+  reader.readAsArrayBuffer(file);
+}
 
 function matchTabHTML(){
   return `
