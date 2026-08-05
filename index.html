@@ -548,6 +548,7 @@ function matchTabHTML(){
       <p class="hint">For distributors already mapped (like Jeplus, Acorn) — upload their current stock/price file. Only items with an existing mapping will update; anything not yet mapped is skipped and reported, not guessed at.</p>
       <label>Distributor</label>
       <select id="stockDistributorSelect" style="max-width:360px; margin-bottom:12px;"></select>
+      <div id="stockFreshnessNote" class="hint" style="margin:-6px 0 12px;"></div>
       <div class="btn-row" style="margin-top:0;">
         <label class="btn btn-primary" style="position:relative;">
           Upload stock file
@@ -556,6 +557,12 @@ function matchTabHTML(){
       </div>
       <p class="hint" style="margin:10px 0 0;">Expected columns: the distributor's own item <span class="mono">code</span>, a <span class="mono">stock</span>/quantity column, and an <span class="mono">MRP</span>/price column.</p>
       <div id="stockUploadResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Inventory freshness — all distributors</h2>
+      <p class="hint">When stock was last uploaded for each distributor, so the team knows what's current vs. stale.</p>
+      <div id="freshnessTable"></div>
     </div>
 
     <div class="card">
@@ -602,7 +609,21 @@ async function loadMatchDistributors(){
   if(stockSel){
     stockSel.innerHTML = `<option value="">Select a distributor...</option>` +
       matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+    stockSel.addEventListener('change', async (e)=>{
+      const note = document.getElementById('stockFreshnessNote');
+      if(!e.target.value){ note.textContent = ''; return; }
+      note.textContent = 'Checking last upload...';
+      const { data } = await sb.from('distributor_inventory_freshness').select('*').eq('distributor_id', e.target.value).maybeSingle();
+      if(data && data.last_updated){
+        const d = new Date(data.last_updated);
+        note.innerHTML = `Last uploaded: <strong>${d.toLocaleString()}</strong> · ${data.items_tracked} items tracked`;
+      } else {
+        note.innerHTML = `<span style="color:var(--amber);">No stock uploaded yet for this distributor.</span>`;
+      }
+    });
   }
+  loadFreshnessTable();
+
   const stockFileInput = document.getElementById('stockFileInput');
   if(stockFileInput) stockFileInput.addEventListener('change', handleStockUpload);
 
@@ -733,6 +754,38 @@ async function handlePdfStockUpload(e){
   }
 }
 
+async function loadFreshnessTable(){
+  const el = document.getElementById('freshnessTable');
+  if(!el) return;
+  el.innerHTML = `<p class="no-history">Loading...</p>`;
+
+  const { data: freshness } = await sb.from('distributor_inventory_freshness').select('*');
+  const freshByDist = Object.fromEntries((freshness||[]).map(f=>[f.distributor_id, f]));
+
+  const rows = matchState.distributors.map(d=>{
+    const f = freshByDist[d.id];
+    return { name: d.name, last_updated: f?.last_updated || null, items_tracked: f?.items_tracked || 0 };
+  }).sort((a,b)=>{
+    if(!a.last_updated && !b.last_updated) return a.name.localeCompare(b.name);
+    if(!a.last_updated) return 1;
+    if(!b.last_updated) return -1;
+    return new Date(b.last_updated) - new Date(a.last_updated);
+  });
+
+  el.innerHTML = `
+    <table class="summary">
+      <tr><th>Distributor</th><th>Last uploaded</th><th>Items tracked</th></tr>
+      ${rows.map(r=>`
+        <tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td>${r.last_updated ? new Date(r.last_updated).toLocaleString() : '<span style="color:var(--amber);">Never</span>'}</td>
+          <td>${r.items_tracked}</td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
+}
+
 async function handleStockUpload(e){
   const file = e.target.files[0];
   const distributorId = document.getElementById('stockDistributorSelect').value;
@@ -807,6 +860,8 @@ async function handleStockUpload(e){
 
     resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — stock updated for ${inserted} mapped items.${unmapped ? ` ${unmapped} rows were skipped (not yet mapped for this distributor — use the mapping tool above first, or the catalog matcher below).` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
     e.target.value = '';
+    loadFreshnessTable();
+    document.getElementById('stockDistributorSelect').dispatchEvent(new Event('change'));
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
   else reader.readAsArrayBuffer(file);
