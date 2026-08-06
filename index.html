@@ -1135,7 +1135,13 @@ async function handleRefillInventoryUpload(e){
       return;
     }
     const cols = Object.keys(rows[0]);
-    const itemCol = cols.find(c=>c.toLowerCase().includes('item') && c.toLowerCase().includes('name')) || cols.find(c=>c.toLowerCase().includes('item'));
+    const itemCol = cols.find(c=>{
+      const lc = c.toLowerCase();
+      return (lc.includes('item') || lc.includes('medicine')) && lc.includes('name');
+    }) || cols.find(c=>{
+      const lc = c.toLowerCase();
+      return lc.includes('item') || lc.includes('medicine');
+    });
     const packCol = cols.find(c=>c.toLowerCase().includes('pack'));
     const stockCol = cols.find(c=>c.toLowerCase().includes('stock'));
 
