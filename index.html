@@ -1,65 +1,2030 @@
--- ============================================================
--- Refill needed: items below their Min Stock threshold, with
--- filters and order-placed status. Run in Supabase SQL Editor.
--- ============================================================
-create or replace function get_refill_needed(
-  p_warehouse_id uuid,
-  p_med_types text[] default null,
-  p_min_unique_cust_60d int default null,
-  p_min_bills_60d int default null
-)
-returns table(
-  item_id uuid, item_name text, pack_size text,
-  current_stock numeric, min_stock numeric, max_stock numeric, reorder_qty numeric,
-  medicine_type text, unique_cust_60d integer, bills_60d integer,
-  last_order_date timestamptz, last_order_distributor text,
-  order_placed boolean, purchased_since_order boolean
-)
-language sql
-stable
-as $$
-  with latest_stock as (
-    select distinct on (item_id) item_id,
-      (coalesce(stock_loose,0) + coalesce(closing_strip,0)) as current_stock, snapshot_at
-    from inventory_snapshots
-    where warehouse_id = p_warehouse_id
-    order by item_id, snapshot_at desc
-  ),
-  latest_analysis as (
-    select distinct on (item_id) item_id, min_stock, max_stock, reorder_qty,
-      medicine_type, unique_cust_60d, bills_60d
-    from medicine_analysis_snapshots
-    where warehouse_id = p_warehouse_id
-    order by item_id, snapshot_date desc
-  ),
-  last_order as (
-    select distinct on (ori.item_id) ori.item_id, r.run_at, d.name as distributor_name
-    from order_run_items ori
-    join order_runs r on r.id = ori.order_run_id
-    left join distributors d on d.id = ori.distributor_id
-    where r.warehouse_id = p_warehouse_id
-    order by ori.item_id, r.run_at desc
-  )
-  select
-    ls.item_id, i.item_name, i.pack_size,
-    ls.current_stock, la.min_stock, la.max_stock, la.reorder_qty,
-    la.medicine_type, la.unique_cust_60d, la.bills_60d,
-    lo.run_at as last_order_date, lo.distributor_name as last_order_distributor,
-    (lo.run_at is not null) as order_placed,
-    coalesce(exists(
-      select 1 from purchase_history ph
-      where ph.item_id = ls.item_id and ph.warehouse_id = p_warehouse_id
-        and lo.run_at is not null and ph.purchase_date >= lo.run_at::date
-    ), false) as purchased_since_order
-  from latest_stock ls
-  join items i on i.id = ls.item_id
-  left join latest_analysis la on la.item_id = ls.item_id
-  left join last_order lo on lo.item_id = ls.item_id
-  where ls.current_stock < coalesce(la.min_stock, 999999999)
-    and (p_med_types is null or la.medicine_type = any(p_med_types))
-    and (p_min_unique_cust_60d is null or la.unique_cust_60d >= p_min_unique_cust_60d)
-    and (p_min_bills_60d is null or la.bills_60d >= p_min_bills_60d)
-  order by (ls.current_stock = 0) desc, la.unique_cust_60d desc nulls last;
-$$;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RapidSurge Purchase</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<style>
+  :root{
+    --ink:#1C2B2B;
+    --paper:#F7F5F0;
+    --card:#FFFFFF;
+    --teal:#0F6B63;
+    --teal-dark:#0A4B45;
+    --amber:#C98A2C;
+    --green:#2F8F5B;
+    --red:#B4432E;
+    --border:#E3E1DA;
+    --muted:#6B7876;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:'Inter',sans-serif; -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,.display{ font-family:'Space Grotesk',sans-serif; letter-spacing:-0.01em; }
+  .mono{ font-family:'IBM Plex Mono',monospace; }
+  button{ font-family:inherit; cursor:pointer; }
+  input, select, textarea{ font-family:inherit; }
 
-grant execute on function get_refill_needed(uuid, text[], int, int) to authenticated;
+  /* ---------- Top bar ---------- */
+  .topbar{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px 20px; background:var(--teal-dark); color:#fff;
+  }
+  .topbar .brand{ display:flex; align-items:center; gap:10px; font-family:'Space Grotesk'; font-weight:700; font-size:18px; }
+  .topbar .brand .dot{ width:10px; height:10px; border-radius:50%; background:var(--amber); }
+  .topbar select{
+    background:rgba(255,255,255,0.12); color:#fff; border:1px solid rgba(255,255,255,0.25);
+    border-radius:8px; padding:8px 10px; font-size:14px;
+  }
+  .topbar select option{ color:#111; }
+  .topbar .right{ display:flex; align-items:center; gap:12px; }
+  .topbar button.logout{
+    background:transparent; border:1px solid rgba(255,255,255,0.3); color:#fff;
+    padding:7px 12px; border-radius:8px; font-size:13px;
+  }
+  .topbar button.logout:hover{ background:rgba(255,255,255,0.1); }
+
+  .tabs{ display:flex; gap:4px; padding:10px 20px 0; background:var(--paper); border-bottom:1px solid var(--border); }
+  .tabs button{
+    background:none; border:none; padding:10px 16px; font-size:14px; font-weight:600;
+    color:var(--muted); border-bottom:2px solid transparent;
+  }
+  .tabs button.active{ color:var(--teal-dark); border-bottom:2px solid var(--teal); }
+
+  .wrap{ max-width:1100px; margin:0 auto; padding:24px 20px 80px; }
+  .card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:22px; margin-bottom:18px; }
+  .card h2{ margin:0 0 4px; font-size:19px; }
+  .card p.hint{ color:var(--muted); font-size:13.5px; margin:0 0 16px; }
+
+  label{ display:block; font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px; }
+  textarea, input[type=text], input[type=email], input[type=password], input[type=number]{
+    width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:9px;
+    font-size:14px; background:#fff; color:var(--ink);
+  }
+  textarea:focus, input:focus, select:focus{ outline:2px solid var(--teal); outline-offset:1px; }
+  textarea{ min-height:160px; resize:vertical; }
+
+  .btn{
+    display:inline-flex; align-items:center; gap:8px; padding:11px 18px; border-radius:9px;
+    border:none; font-weight:600; font-size:14px;
+  }
+  .btn-primary{ background:var(--teal); color:#fff; }
+  .btn-primary:hover{ background:var(--teal-dark); }
+  .btn-primary:disabled{ background:#a9c2bf; cursor:not-allowed; }
+  .btn-ghost{ background:transparent; border:1px solid var(--border); color:var(--ink); }
+  .btn-ghost:hover{ background:#F0EEE7; }
+  .btn-row{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+
+  /* ---------- Login ---------- */
+  .login-screen{ min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .login-card{ width:100%; max-width:380px; background:#fff; border:1px solid var(--border); border-radius:16px; padding:32px; }
+  .login-card .brand{ display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .login-card .brand .dot{ width:11px; height:11px; border-radius:50%; background:var(--amber); }
+  .login-card h1{ font-size:22px; margin:0 0 4px; }
+  .login-card p{ color:var(--muted); font-size:13.5px; margin:0 0 22px; }
+  .field{ margin-bottom:14px; }
+  .error-msg{ background:#FBEAE6; border:1px solid #EFC6BA; color:var(--red); padding:10px 12px; border-radius:8px; font-size:13px; margin-bottom:14px; }
+
+  /* ---------- Suggestion cards ---------- */
+  .item-row{ border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:12px; background:#fff; }
+  .item-row .item-head{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .item-row .item-name{ font-weight:700; font-size:15px; }
+  .item-row .item-meta{ font-size:12.5px; color:var(--muted); }
+  .qty-badge{ font-family:'IBM Plex Mono'; background:#EEF4F1; color:var(--teal-dark); padding:3px 9px; border-radius:6px; font-size:13px; font-weight:500; }
+
+  .ladder{ display:flex; flex-direction:column; gap:6px; }
+  .ladder-item{
+    display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:8px; border:1px solid var(--border);
+  }
+  .ladder-item.top{ border-color:var(--teal); background:#F1F7F5; }
+  .rank-chip{
+    width:22px; height:22px; border-radius:50%; background:var(--teal); color:#fff; font-size:11.5px;
+    display:flex; align-items:center; justify-content:center; font-weight:700; flex-shrink:0;
+  }
+  .ladder-item.rank2 .rank-chip, .ladder-item.rank3 .rank-chip, .ladder-item.rank4 .rank-chip{ background:#9AAFAC; }
+  .ladder-dist{ font-weight:600; font-size:13.5px; flex:1; min-width:120px; }
+  .ladder-stats{ font-size:12px; color:var(--muted); font-family:'IBM Plex Mono'; white-space:nowrap; }
+  .no-history{ color:var(--muted); font-size:13px; font-style:italic; padding:8px 0; }
+
+  select.choose{ margin-top:10px; width:100%; max-width:320px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; font-size:13px; }
+
+  table.summary{ width:100%; border-collapse:collapse; font-size:13.5px; }
+  table.summary th, table.summary td{ text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
+  table.summary th{ color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+
+  .empty-state{ text-align:center; padding:40px 20px; color:var(--muted); }
+
+  .badge-warn{ display:inline-block; background:#FDF2E3; color:var(--amber); border:1px solid #F0DBB0; padding:2px 8px; border-radius:6px; font-size:11.5px; font-weight:600; }
+
+  .grid-2{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:600px){ .grid-2{ grid-template-columns:1fr; } }
+
+  .spinner{ display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.4); border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  ul.admin-list{ list-style:none; padding:0; margin:0; }
+  ul.admin-list li{ display:flex; justify-content:space-between; padding:9px 0; border-bottom:1px solid var(--border); font-size:14px; }
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+// ============================================================
+// CONFIG — your Supabase project
+// ============================================================
+const SUPABASE_URL = "https://ffsobagjqcwqgmoyphlu.supabase.co";
+const SUPABASE_KEY = "sb_publishable_VGM9tD_t4FnIpEx-anuN8g_3DpR3l50";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+
+let state = {
+  session: null,
+  warehouses: [],
+  currentWarehouse: null,
+  activeTab: 'order',
+  parsedRows: [],       // {raw, qty, item, candidates, status}
+  suggestions: {},      // item_id -> [ {distributor_name, last_purchased, avg_margin_pct, ...} ]
+  chosen: {},           // item_id -> distributor_id chosen
+  loadingOrder: false,
+};
+
+const app = document.getElementById('app');
+
+// ============================================================
+// RENDER ROOT
+// ============================================================
+function render(){
+  if(!state.session){
+    renderLogin();
+  } else {
+    renderMain();
+  }
+}
+
+// ============================================================
+// LOGIN
+// ============================================================
+function renderLogin(errorMsg){
+  app.innerHTML = `
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="brand"><span class="dot"></span><strong>RapidSurge</strong></div>
+        <h1>Purchase Team Login</h1>
+        <p>Sign in with your team account to continue.</p>
+        ${errorMsg ? `<div class="error-msg">${errorMsg}</div>` : ''}
+        <form id="loginForm">
+          <div class="field">
+            <label>Email</label>
+            <input type="email" id="loginEmail" required autocomplete="username">
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input type="password" id="loginPassword" required autocomplete="current-password">
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%; justify-content:center;" id="loginBtn">Sign in</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('loginForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const btn = document.getElementById('loginBtn');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Signing in...';
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPassword').value;
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if(error){
+      renderLogin(error.message);
+      return;
+    }
+    state.session = data.session;
+    await loadWarehouses();
+    render();
+  });
+}
+
+// ============================================================
+// LOAD WAREHOUSES
+// ============================================================
+async function loadWarehouses(){
+  const { data, error } = await sb.from('warehouses').select('*').eq('active', true).order('name');
+  if(!error && data){
+    state.warehouses = data;
+    if(!state.currentWarehouse && data.length) state.currentWarehouse = data[0].id;
+  }
+}
+
+// ============================================================
+// MAIN SHELL
+// ============================================================
+function renderMain(){
+  app.innerHTML = `
+    <div class="topbar">
+      <div class="brand"><span class="dot"></span> RapidSurge Purchase</div>
+      <div class="right">
+        <select id="warehouseSelect">
+          ${state.warehouses.map(w => `<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${w.name}</option>`).join('')}
+        </select>
+        <button class="logout" id="logoutBtn">Log out</button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
+      <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
+      <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
+      <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
+      <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
+      <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>
+    </div>
+    <div class="wrap" id="tabContent"></div>
+  `;
+  document.getElementById('warehouseSelect').addEventListener('change', (e)=>{
+    state.currentWarehouse = e.target.value;
+    state.suggestions = {}; state.parsedRows = []; state.chosen = {};
+    renderTabContent();
+  });
+  document.getElementById('logoutBtn').addEventListener('click', async ()=>{
+    await sb.auth.signOut();
+    state.session = null;
+    render();
+  });
+  document.querySelectorAll('.tabs button').forEach(b=>{
+    b.addEventListener('click', ()=>{ state.activeTab = b.dataset.tab; render(); });
+  });
+  renderTabContent();
+}
+
+function renderTabContent(){
+  const el = document.getElementById('tabContent');
+  if(state.activeTab === 'order') el.innerHTML = orderTabHTML();
+  else if(state.activeTab === 'repeats'){ el.innerHTML = repeatsTabHTML(); initRepeatsTab(); }
+  else if(state.activeTab === 'inventory'){ el.innerHTML = inventoryTabHTML(); loadInventoryAnalysis(); }
+  else if(state.activeTab === 'refill'){ el.innerHTML = refillTabHTML(); initRefillTab(); }
+  else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
+  else el.innerHTML = adminTabHTML();
+  attachTabHandlers();
+}
+
+// ============================================================
+// ORDER TAB
+// ============================================================
+function orderTabHTML(){
+  return `
+    <div class="card">
+      <h2>Paste your order list</h2>
+      <p class="hint">One item per line: <span class="mono">item name, pack size, quantity</span> — separated by a comma or tab. If you use the item <strong>code</strong> instead of name, pack size can be left blank since the code is already exact. Or upload a .csv/.xlsx with the same columns.</p>
+      <textarea id="orderInput" placeholder="Paracetamol 500 Tablet, 10 Tablet, 20&#10;Azithromycin 500 Tablet, 6 Tablet, 10&#10;M0004521, , 50"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="matchBtn">Find distributors</button>
+        <label class="btn btn-ghost" style="position:relative;">
+          Upload file
+          <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="downloadSampleOrderBtn">Download sample format</button>
+        <button class="btn btn-ghost" id="exportBtn" style="display:${state.parsedRows.length ? 'inline-flex' : 'none'};">Download Excel</button>
+      </div>
+    </div>
+    <div id="resultsArea">${resultsHTML()}</div>
+  `;
+}
+
+function resultsHTML(){
+  if(state.loadingOrder){
+    return `<div class="card empty-state">Matching items and finding distributors...</div>`;
+  }
+  if(!state.parsedRows.length){
+    return `<div class="card empty-state">Paste or upload your order list above to get started.</div>`;
+  }
+  return state.parsedRows.map(row => itemRowHTML(row)).join('');
+}
+
+function itemRowHTML(row){
+  if(row.status === 'not_found'){
+    return `
+      <div class="item-row">
+        <div class="item-head">
+          <div><span class="badge-warn">Not matched</span> <span class="item-name">${escapeHtml(row.raw)}</span></div>
+          <span class="qty-badge">Qty ${row.qty}</span>
+        </div>
+        <p class="no-history">${row.note ? escapeHtml(row.note) : "Couldn't find this in your item master list. Add it there, or check spelling."}</p>
+      </div>
+    `;
+  }
+  if(row.status === 'ambiguous'){
+    return `
+      <div class="item-row">
+        <div class="item-head">
+          <div><span class="badge-warn">Multiple pack sizes — pick one</span> <span class="item-name">${escapeHtml(row.raw)}</span></div>
+          <span class="qty-badge">Qty ${row.qty}</span>
+        </div>
+        <p class="no-history">This name matches ${row.options.length} different pack sizes. Re-enter the line with the pack size, or use the item code instead:</p>
+        <table class="summary">
+          <tr><th>Pack size</th><th>Code</th></tr>
+          ${row.options.map(o=>`<tr><td>${escapeHtml(o.pack_size)}</td><td class="mono">${escapeHtml(o.code)}</td></tr>`).join('')}
+        </table>
+      </div>
+    `;
+  }
+  const item = row.item;
+  const sugg = state.suggestions[item.id] || [];
+  const ladder = sugg.length ? `
+    <div class="ladder">
+      ${sugg.map((s,i)=>{
+        const inStock = s.live_stock !== null && s.live_stock !== undefined && s.live_stock > 0;
+        return `
+        <div class="ladder-item ${i===0?'top':'rank'+(i+1)}">
+          <div class="rank-chip">${i+1}</div>
+          <div class="ladder-dist">${escapeHtml(s.distributor_name)} ${inStock ? `<span class="badge-warn" style="background:#E8F4EE; color:var(--green); border-color:#BFE3CE;">In stock: ${s.live_stock}</span>` : ''}</div>
+          <div class="ladder-stats">${s.last_purchased ? `last: ${s.last_purchased} · ` : (inStock ? 'no purchase history yet · ' : '')}margin ${s.avg_margin_pct ?? '-'}%${inStock && s.live_price ? ` · MRP ₹${s.live_price}` : ''}</div>
+        </div>
+      `}).join('')}
+    </div>
+    <select class="choose" data-item="${item.id}">
+      <option value="">Choose distributor for this item...</option>
+      ${sugg.map(s=>`<option value="${s.distributor_id}" ${state.chosen[item.id]===s.distributor_id?'selected':''}>${escapeHtml(s.distributor_name)}</option>`).join('')}
+    </select>
+  ` : `<p class="no-history">No purchase history for this item at this warehouse yet — call distributors manually or check Pharmarack.</p>`;
+
+  return `
+    <div class="item-row">
+      <div class="item-head">
+        <div><span class="item-name">${escapeHtml(item.item_name)}</span> <span class="item-meta">${escapeHtml(item.pack_size||'')} · ${escapeHtml(item.code)}</span></div>
+        <span class="qty-badge">Qty ${row.qty}</span>
+      </div>
+      ${ladder}
+    </div>
+  `;
+}
+
+function attachTabHandlers(){
+  const matchBtn = document.getElementById('matchBtn');
+  if(matchBtn) matchBtn.addEventListener('click', handleMatch);
+
+  const fileInput = document.getElementById('fileInput');
+  if(fileInput) fileInput.addEventListener('change', handleFileUpload);
+
+  const exportBtn = document.getElementById('exportBtn');
+  if(exportBtn) exportBtn.addEventListener('click', exportExcel);
+
+  const downloadSampleOrderBtn = document.getElementById('downloadSampleOrderBtn');
+  if(downloadSampleOrderBtn) downloadSampleOrderBtn.addEventListener('click', downloadSampleOrderFormat);
+
+  const downloadSampleMappingBtn = document.getElementById('downloadSampleMappingBtn');
+  if(downloadSampleMappingBtn) downloadSampleMappingBtn.addEventListener('click', downloadSampleMappingFormat);
+
+  document.querySelectorAll('select.choose').forEach(sel=>{
+    sel.addEventListener('change', (e)=>{
+      state.chosen[e.target.dataset.item] = e.target.value || null;
+    });
+  });
+
+  // admin handlers
+  const addWhForm = document.getElementById('addWarehouseForm');
+  if(addWhForm) addWhForm.addEventListener('submit', handleAddWarehouse);
+  const addDistForm = document.getElementById('addDistributorForm');
+  if(addDistForm) addDistForm.addEventListener('submit', handleAddDistributor);
+}
+
+function handleFileUpload(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = (evt)=>{
+    let text = '';
+    if(file.name.endsWith('.csv')){
+      text = evt.target.result;
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, {header:1});
+      text = rows.map(r=>r.join(',')).join('\n');
+    }
+    document.getElementById('orderInput').value = text;
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+// ============================================================
+// MATCH ITEMS + GET SUGGESTIONS
+// ============================================================
+async function handleMatch(){
+  const raw = document.getElementById('orderInput').value.trim();
+  if(!raw) return;
+  state.loadingOrder = true;
+  document.getElementById('resultsArea').innerHTML = resultsHTML();
+
+  const lines = raw.split('\n').map(l=>l.trim()).filter(Boolean);
+  const parsed = lines.map(line=>{
+    const parts = line.split(/\t|,/).map(p=>p.trim());
+    let identifier, pack, qtyRaw;
+    if(parts.length >= 3){ identifier = parts[0]; pack = parts[1]; qtyRaw = parts[2]; }
+    else { identifier = parts[0]; pack = ''; qtyRaw = parts[1]; }
+    const qty = qtyRaw ? (parseInt(qtyRaw.replace(/[^0-9]/g,'')) || 1) : 1;
+    return { raw: identifier, pack, qty };
+  });
+
+  const identifiers = parsed.map(p=>p.raw);
+
+  // try exact code match (unambiguous, pack size not needed)
+  const { data: byCode } = await sb.from('items').select('*').in('code', identifiers);
+  // fetch ALL items matching by name — may return multiple pack-size variants per name
+  const { data: byName } = await sb.from('items').select('*').in('item_name', identifiers);
+
+  const rows = parsed.map(p=>{
+    const codeMatch = (byCode||[]).find(i=>i.code === p.raw);
+    if(codeMatch) return { raw: p.raw, qty: p.qty, item: codeMatch, status: 'matched' };
+
+    const nameCandidates = (byName||[]).filter(i=>i.item_name.toLowerCase() === p.raw.toLowerCase());
+    if(nameCandidates.length === 0){
+      return { raw: p.raw, qty: p.qty, status: 'not_found' };
+    }
+    if(p.pack){
+      const packMatch = nameCandidates.find(i=>String(i.pack_size).toLowerCase().trim() === p.pack.toLowerCase().trim());
+      if(packMatch) return { raw: p.raw, qty: p.qty, item: packMatch, status: 'matched' };
+      return { raw: p.raw, qty: p.qty, status: 'not_found', note: `No match for pack size "${p.pack}". Available: ${nameCandidates.map(c=>c.pack_size).join(', ')}` };
+    }
+    if(nameCandidates.length === 1){
+      return { raw: p.raw, qty: p.qty, item: nameCandidates[0], status: 'matched' };
+    }
+    // multiple pack-size variants exist and no pack size was given — ambiguous
+    return { raw: p.raw, qty: p.qty, status: 'ambiguous', options: nameCandidates };
+  });
+
+  state.parsedRows = rows;
+
+  const itemIds = rows.filter(r=>r.status==='matched').map(r=>r.item.id);
+  if(itemIds.length){
+    const { data: suggData, error } = await sb.rpc('get_distributor_suggestions', {
+      p_warehouse_id: state.currentWarehouse,
+      p_item_ids: itemIds
+    });
+    if(!error && suggData){
+      state.suggestions = {};
+      suggData.forEach(s=>{
+        if(!state.suggestions[s.item_id]) state.suggestions[s.item_id] = [];
+        state.suggestions[s.item_id].push(s);
+      });
+    }
+    logOrderRun(rows).catch(()=>{}); // fire-and-forget, don't block UI on this
+  }
+
+  state.loadingOrder = false;
+  document.getElementById('resultsArea').innerHTML = resultsHTML();
+  const exportBtn = document.getElementById('exportBtn');
+  if(exportBtn) exportBtn.style.display = state.parsedRows.length ? 'inline-flex' : 'none';
+  attachTabHandlers();
+}
+
+// ============================================================
+// EXPORT TO EXCEL
+// ============================================================
+function exportExcel(){
+  const rows = state.parsedRows.map(r=>{
+    if(r.status === 'not_found'){
+      return { 'Item': r.raw, 'Qty': r.qty, 'Distributor 1':'', 'Distributor 2':'', 'Distributor 3':'', 'Distributor 4':'',
+        'Margin 1':'', 'Margin 2':'', 'Margin 3':'', 'Margin 4':'',
+        'Last Purchased 1':'', 'Last Purchased 2':'', 'Last Purchased 3':'', 'Last Purchased 4':'' };
+    }
+    if(r.status === 'ambiguous'){
+      return { 'Item': `${r.raw} (AMBIGUOUS — pick pack size: ${r.options.map(o=>o.pack_size).join(' / ')})`, 'Qty': r.qty,
+        'Distributor 1':'', 'Distributor 2':'', 'Distributor 3':'', 'Distributor 4':'',
+        'Margin 1':'', 'Margin 2':'', 'Margin 3':'', 'Margin 4':'',
+        'Last Purchased 1':'', 'Last Purchased 2':'', 'Last Purchased 3':'', 'Last Purchased 4':'' };
+    }
+    const sugg = state.suggestions[r.item.id] || [];
+    const s = i => sugg[i] || {};
+    return {
+      'Item': r.item.item_name,
+      'Qty': r.qty,
+      'Distributor 1': s(0).distributor_name||'', 'Distributor 2': s(1).distributor_name||'',
+      'Distributor 3': s(2).distributor_name||'', 'Distributor 4': s(3).distributor_name||'',
+      'Margin 1': s(0).avg_margin_pct||'', 'Margin 2': s(1).avg_margin_pct||'',
+      'Margin 3': s(2).avg_margin_pct||'', 'Margin 4': s(3).avg_margin_pct||'',
+      'Last Purchased 1': s(0).last_purchased||'', 'Last Purchased 2': s(1).last_purchased||'',
+      'Last Purchased 3': s(2).last_purchased||'', 'Last Purchased 4': s(3).last_purchased||''
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!autofilter'] = { ref: ws['!ref'] };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Order');
+  const whName = state.warehouses.find(w=>w.id===state.currentWarehouse)?.name || 'order';
+  XLSX.writeFile(wb, `RapidSurge_Order_${whName}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+async function logOrderRun(rows){
+  const matchedRows = rows.filter(r=>r.status==='matched');
+  if(!matchedRows.length) return;
+
+  const { data: run, error: runErr } = await sb.from('order_runs')
+    .insert({ warehouse_id: state.currentWarehouse })
+    .select().single();
+  if(runErr || !run) return;
+
+  const items = matchedRows.map(r=>{
+    const sugg = state.suggestions[r.item.id] || [];
+    const chosenId = state.chosen[r.item.id];
+    const topDistributor = sugg.find(s=>s.distributor_id===chosenId) || sugg[0];
+    return {
+      order_run_id: run.id,
+      item_id: r.item.id,
+      qty: r.qty,
+      distributor_id: topDistributor ? topDistributor.distributor_id : null,
+    };
+  });
+  await sb.from('order_run_items').insert(items);
+}
+
+// ============================================================
+// REPEAT ORDERS TAB
+// ============================================================
+function repeatsTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload order sheet</h2>
+      <p class="hint">For order sheets from your own export (item name, pack size, distributor ordered to, qty, last order date). Groups items by date into order runs — same repeat-order logic as orders placed live in the app.</p>
+      <label>Warehouse</label>
+      <select id="orderSheetWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <label>Order date &amp; time (when this order was placed)</label>
+      <input type="datetime-local" id="orderSheetDateTime" style="max-width:280px; margin-bottom:12px;">
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload order sheet
+          <input type="file" id="orderSheetInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="downloadSampleOrderSheetBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>. Extra columns (stock, sales history, etc.) are fine — they're just ignored for this upload.</p>
+      <div id="orderSheetResult"></div>
+    </div>
+    <div class="card">
+      <h2>Repeat orders</h2>
+      <p class="hint">Items ordered on 2+ different days recently for the selected warehouse. Cross-checked against purchase history to guess why it's repeating.</p>
+    </div>
+    <div id="repeatsArea"></div>
+  `;
+}
+
+function initRepeatsTab(){
+  const input = document.getElementById('orderSheetInput');
+  if(input) input.addEventListener('change', handleOrderSheetUpload);
+  const sampleBtn = document.getElementById('downloadSampleOrderSheetBtn');
+  if(sampleBtn) sampleBtn.addEventListener('click', downloadSampleOrderSheetFormat);
+  const dtInput = document.getElementById('orderSheetDateTime');
+  if(dtInput){
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    dtInput.value = now.toISOString().slice(0,16);
+  }
+  loadRepeats();
+}
+
+function downloadSampleOrderSheetFormat(){
+  const rows = [
+    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Current Stock(loose)': 4, 'Current Stock(strip)': 1,
+      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited', 'Qty': 2,
+      'Last Order Date': '2026-08-01', 'Order to place': 3,
+      'Last 7 days Sale': 4, 'Last 15 days Sale': 11, 'Last 30 days Sale': 14, 'Last 45 days Sale': 30,
+      'Last 60 days Sale': 43, 'Last 90 Days': 70, 'Last 120 Days': 89, 'Last 180': 112,
+      'Unique Cust (7days)': 4, 'Unique Cust(15 days)': 19, 'Unique Cust(45 days)': 26, 'Unique Cust(60 days)': 39,
+      'unique Cust(90 days)': 39, 'No of Bills(30 d)': 16, 'No of Bills(60 d)': 35, 'No of Bills(120 d)': 71 },
+    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Current Stock(loose)': 0, 'Current Stock(strip)': 0,
+      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited', 'Qty': 5,
+      'Last Order Date': '2026-08-02', 'Order to place': 5,
+      'Last 7 days Sale': 8, 'Last 15 days Sale': 20, 'Last 30 days Sale': 40, 'Last 45 days Sale': 55,
+      'Last 60 days Sale': 70, 'Last 90 Days': 100, 'Last 120 Days': 130, 'Last 180': 180,
+      'Unique Cust (7days)': 7, 'Unique Cust(15 days)': 15, 'Unique Cust(45 days)': 30, 'Unique Cust(60 days)': 40,
+      'unique Cust(90 days)': 50, 'No of Bills(30 d)': 25, 'No of Bills(60 d)': 45, 'No of Bills(120 d)': 90 },
+    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Current Stock(loose)': 2, 'Current Stock(strip)': 0,
+      'Type of Medicine': 'Average', 'Distributor Name order place to': 'Neelkanth Pharma Logistics Private Limited', 'Qty': 3,
+      'Last Order Date': '2026-08-03', 'Order to place': 3,
+      'Last 7 days Sale': 1, 'Last 15 days Sale': 3, 'Last 30 days Sale': 5, 'Last 45 days Sale': 8,
+      'Last 60 days Sale': 10, 'Last 90 Days': 15, 'Last 120 Days': 20, 'Last 180': 28,
+      'Unique Cust (7days)': 1, 'Unique Cust(15 days)': 3, 'Unique Cust(45 days)': 6, 'Unique Cust(60 days)': 8,
+      'unique Cust(90 days)': 10, 'No of Bills(30 d)': 4, 'No of Bills(60 d)': 8, 'No of Bills(120 d)': 15 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Order Sheet');
+  XLSX.writeFile(wb, 'sample_order_sheet_format.xlsx');
+}
+
+async function handleOrderSheetUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('orderSheetWarehouseSelect').value;
+  const dateTimeVal = document.getElementById('orderSheetDateTime').value;
+  const resultEl = document.getElementById('orderSheetResult');
+  if(!file) return;
+  if(!dateTimeVal){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please set the order date & time first.</p>`;
+    e.target.value = '';
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...keywords) => cols.find(c => keywords.every(k => c.toLowerCase().includes(k)));
+    const itemCol = find('item', 'name') || find('item');
+    const packCol = find('pack');
+    const distCol = find('distributor');
+    const qtyCol = cols.find(c => {
+      const lc = c.toLowerCase().trim();
+      return (lc === 'qty' || lc.includes('qty')) && !lc.includes('place');
+    });
+    // Feature 2 columns — all optional, only used if present
+    const stockLooseCol = find('stock', 'loose');
+    const stockStripCol = find('strip');
+    const medTypeCol = cols.find(c => c.toLowerCase().includes('type') && !c.toLowerCase().includes('distributor'));
+    const lastSaleCol = find('last', 'order', 'date') || find('last', 'sale');
+    const salesCols = {
+      sales_7d: cols.find(c=>/7\s*days?\s*sale/i.test(c)),
+      sales_15d: cols.find(c=>/15\s*days?\s*sale/i.test(c)),
+      sales_30d: cols.find(c=>/30\s*days?\s*sale/i.test(c)),
+      sales_45d: cols.find(c=>/45\s*days?\s*sale/i.test(c)),
+      sales_60d: cols.find(c=>/60\s*days?\s*sale/i.test(c)),
+      sales_90d: cols.find(c=>/90\s*days?\s*sale/i.test(c) || /90\s*day/i.test(c)),
+      sales_120d: cols.find(c=>/120\s*days?\s*sale/i.test(c) || /120\s*day/i.test(c)),
+      sales_180d: cols.find(c=>/180/i.test(c) && /sale|day/i.test(c)),
+    };
+    const custCols = {
+      unique_cust_7d: cols.find(c=>/unique.*cust.*7\s*days?/i.test(c)),
+      unique_cust_15d: cols.find(c=>/unique.*cust.*15\s*days?/i.test(c)),
+      unique_cust_45d: cols.find(c=>/unique.*cust.*45\s*days?/i.test(c)),
+      unique_cust_60d: cols.find(c=>/unique.*cust.*60\s*days?/i.test(c)),
+      unique_cust_90d: cols.find(c=>/unique.*cust.*90\s*days?/i.test(c)),
+    };
+    const billsCols = {
+      bills_30d: cols.find(c=>/bills?\(?30/i.test(c)),
+      bills_60d: cols.find(c=>/bills?\(?60/i.test(c)),
+      bills_120d: cols.find(c=>/bills?\(?120/i.test(c)),
+    };
+    const hasInventoryData = !!(stockLooseCol || stockStripCol || medTypeCol);
+
+    if(!itemCol || !qtyCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+
+    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const { data: distData } = await sb.from('distributors').select('id, name');
+    const { data: aliasData } = await sb.from('distributor_aliases').select('alias, distributor_id');
+
+    const nameToItems = {};
+    (itemsData||[]).forEach(i=>{
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    const distByName = Object.fromEntries((distData||[]).map(d=>[d.name.trim().toLowerCase(), d.id]));
+    const distByAlias = Object.fromEntries((aliasData||[]).map(a=>[a.alias.trim().toLowerCase(), a.distributor_id]));
+
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const packMatch = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return packMatch ? packMatch.id : null;
+      }
+      return null;
+    }
+    function resolveDistributor(name){
+      if(!name) return null;
+      const key = String(name).trim().toLowerCase();
+      return distByName[key] || distByAlias[key] || null;
+    }
+
+    let itemUnmatched = 0, distUnmatched = 0;
+    const runItemsToInsert = [];
+    const invSnapshotsToInsert = [];
+    const runAtIso = new Date(dateTimeVal).toISOString();
+    rows.forEach(r=>{
+      const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
+      if(!itemId){ itemUnmatched++; return; }
+      const distId = distCol ? resolveDistributor(r[distCol]) : null;
+      if(distCol && r[distCol] && !distId) distUnmatched++;
+      const qty = parseInt(r[qtyCol]) || 0;
+      runItemsToInsert.push({ item_id: itemId, qty, distributor_id: distId });
+
+      if(hasInventoryData){
+        const numOrNull = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
+        invSnapshotsToInsert.push({
+          item_id: itemId,
+          warehouse_id: warehouseId,
+          snapshot_at: runAtIso,
+          stock_loose: numOrNull(stockLooseCol ? r[stockLooseCol] : null),
+          closing_strip: numOrNull(stockStripCol ? r[stockStripCol] : null),
+          med_type: medTypeCol ? r[medTypeCol] : null,
+          last_sale_date: lastSaleCol && r[lastSaleCol] ? (r[lastSaleCol] instanceof Date ? r[lastSaleCol].toISOString().slice(0,10) : String(r[lastSaleCol])) : null,
+          sales_7d: numOrNull(salesCols.sales_7d ? r[salesCols.sales_7d] : null),
+          sales_15d: numOrNull(salesCols.sales_15d ? r[salesCols.sales_15d] : null),
+          sales_30d: numOrNull(salesCols.sales_30d ? r[salesCols.sales_30d] : null),
+          sales_45d: numOrNull(salesCols.sales_45d ? r[salesCols.sales_45d] : null),
+          sales_60d: numOrNull(salesCols.sales_60d ? r[salesCols.sales_60d] : null),
+          sales_90d: numOrNull(salesCols.sales_90d ? r[salesCols.sales_90d] : null),
+          sales_120d: numOrNull(salesCols.sales_120d ? r[salesCols.sales_120d] : null),
+          sales_180d: numOrNull(salesCols.sales_180d ? r[salesCols.sales_180d] : null),
+          unique_cust_7d: numOrNull(custCols.unique_cust_7d ? r[custCols.unique_cust_7d] : null),
+          unique_cust_15d: numOrNull(custCols.unique_cust_15d ? r[custCols.unique_cust_15d] : null),
+          unique_cust_45d: numOrNull(custCols.unique_cust_45d ? r[custCols.unique_cust_45d] : null),
+          unique_cust_60d: numOrNull(custCols.unique_cust_60d ? r[custCols.unique_cust_60d] : null),
+          unique_cust_90d: numOrNull(custCols.unique_cust_90d ? r[custCols.unique_cust_90d] : null),
+          bills_30d: numOrNull(billsCols.bills_30d ? r[billsCols.bills_30d] : null),
+          bills_60d: numOrNull(billsCols.bills_60d ? r[billsCols.bills_60d] : null),
+          bills_120d: numOrNull(billsCols.bills_120d ? r[billsCols.bills_120d] : null),
+        });
+      }
+    });
+
+    if(!runItemsToInsert.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be matched. ${itemUnmatched} rows had unrecognized items.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const { data: run, error: runErr } = await sb.from('order_runs')
+      .insert({ warehouse_id: warehouseId, run_at: runAtIso })
+      .select().single();
+
+    if(runErr || !run){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't create order run: ${escapeHtml(runErr?.message || 'unknown error')}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const finalItems = runItemsToInsert.map(i => ({ ...i, order_run_id: run.id }));
+    const { error: itemsErr } = await sb.from('order_run_items').insert(finalItems);
+    const itemsLogged = itemsErr ? 0 : finalItems.length;
+
+    let invLogged = 0, invErrMsg = '';
+    if(hasInventoryData && invSnapshotsToInsert.length){
+      for(let i=0; i<invSnapshotsToInsert.length; i+=500){
+        const chunk = invSnapshotsToInsert.slice(i, i+500);
+        const { error: invErr } = await sb.from('inventory_snapshots').insert(chunk);
+        if(!invErr) invLogged += chunk.length;
+        else invErrMsg = invErr.message;
+      }
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows for Feature 2 analysis.${invErrMsg ? ` (Some snapshot rows failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>`;
+    e.target.value = '';
+    loadRepeats();
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function loadRepeats(){
+  const el = document.getElementById('repeatsArea');
+  el.innerHTML = `<div class="card empty-state">Loading...</div>`;
+  const { data, error } = await sb.rpc('get_repeat_orders', { p_warehouse_id: state.currentWarehouse, p_days_back: 14 });
+  if(error || !data || !data.length){
+    el.innerHTML = `<div class="card empty-state">No repeat orders found in the last 14 days for this warehouse — either everything's flowing smoothly, or no order runs have been logged yet (order runs are saved automatically each time you click "Find distributors" in New Order).</div>`;
+    return;
+  }
+  el.innerHTML = data.map(r=>{
+    const isProblem = r.likely_reason.includes('Not delivered');
+    return `
+      <div class="item-row" style="border-color:${isProblem ? 'var(--red)' : 'var(--border)'};">
+        <div class="item-head">
+          <div><span class="item-name">${escapeHtml(r.item_name)}</span> <span class="item-meta">${escapeHtml(r.pack_size||'')} · ${escapeHtml(r.code)}</span></div>
+          <span class="qty-badge">Ordered on ${r.distinct_days} days</span>
+        </div>
+        <p class="no-history" style="color:${isProblem ? 'var(--red)' : 'var(--green)'}; font-style:normal; font-weight:600;">${escapeHtml(r.likely_reason)}</p>
+        <p class="no-history">Dates: ${r.run_dates.join(', ')} · Latest qty ordered: ${r.latest_qty}</p>
+      </div>
+    `;
+  }).join('');
+}
+let matchState = {
+  distributors: [],
+  currentDistributor: null,
+  pendingItemIds: [],
+  currentBatch: [],   // [{item_id, item_name, pack_size, candidates:[...]}]
+  reviewedCount: 0,
+  totalPending: 0,
+  loading: false,
+};
+
+// ============================================================
+// INVENTORY ANALYSIS TAB (Feature 2)
+// ============================================================
+function inventoryTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload medicine analysis</h2>
+      <p class="hint">Upload the output of your sales-velocity analysis script (the "Medicine Analysis" sheet) — stored as-is, since it's your validated logic, not recomputed here.</p>
+      <label>Warehouse</label>
+      <select id="analysisWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <label>Snapshot date (when this analysis was run)</label>
+      <input type="date" id="analysisSnapshotDate" style="max-width:200px; margin-bottom:12px;">
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload analysis file
+          <input type="file" id="analysisFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <div id="analysisUploadResult"></div>
+    </div>
+    <div class="card">
+      <h2>Zero stock</h2>
+      <p class="hint">Items currently at zero combined stock (loose + strip), from order sheet uploads in the Repeat Orders tab.</p>
+      <div id="zeroStockArea"></div>
+    </div>
+    <div class="card">
+      <h2>Dead stock review</h2>
+      <p class="hint">Items with no recent sale, sorted by longest since last order — from your latest uploaded analysis.</p>
+      <div id="deadStockArea"></div>
+    </div>
+    <div class="card">
+      <h2>Medicine type breakdown</h2>
+      <div id="typeBreakdownArea"></div>
+    </div>
+  `;
+}
+
+async function loadInventoryAnalysis(){
+  const dateInput = document.getElementById('analysisSnapshotDate');
+  if(dateInput && !dateInput.value) dateInput.value = new Date().toISOString().slice(0,10);
+  const fileInput = document.getElementById('analysisFileInput');
+  if(fileInput) fileInput.addEventListener('change', handleAnalysisUpload);
+
+  const zeroEl = document.getElementById('zeroStockArea');
+  zeroEl.innerHTML = `<p class="no-history">Loading...</p>`;
+  const { data: zeroData } = await sb.rpc('get_zero_stock_status', { p_warehouse_id: state.currentWarehouse });
+  if(!zeroData || !zeroData.length){
+    zeroEl.innerHTML = `<p class="no-history">No inventory snapshots yet for this warehouse — upload an order sheet with stock columns in the Repeat Orders tab first.</p>`;
+  } else {
+    const zeroItems = zeroData.filter(r=>r.currently_zero);
+    zeroEl.innerHTML = !zeroItems.length
+      ? `<p class="no-history" style="color:var(--green);">Nothing currently at zero stock.</p>`
+      : `<table class="summary">
+          <tr><th>Item</th><th>Days at zero</th><th>Zero snapshots</th></tr>
+          ${zeroItems.map(r=>`
+            <tr>
+              <td>${escapeHtml(r.item_name)} <span class="mono" style="color:var(--muted); font-size:12px;">${escapeHtml(r.pack_size||'')}</span></td>
+              <td style="color:var(--red); font-weight:600;">${r.days_at_zero!==null ? r.days_at_zero.toFixed(1) : '-'}</td>
+              <td>${r.total_zero_snapshots} / ${r.total_snapshots}</td>
+            </tr>
+          `).join('')}
+        </table>`;
+  }
+
+  await loadAnalysisSummaries();
+}
+
+async function loadAnalysisSummaries(){
+  const deadEl = document.getElementById('deadStockArea');
+  const typeEl = document.getElementById('typeBreakdownArea');
+  deadEl.innerHTML = `<p class="no-history">Loading...</p>`;
+  typeEl.innerHTML = `<p class="no-history">Loading...</p>`;
+
+  // latest snapshot_date for this warehouse
+  const { data: latestRow } = await sb.from('medicine_analysis_snapshots')
+    .select('snapshot_date').eq('warehouse_id', state.currentWarehouse)
+    .order('snapshot_date', { ascending: false }).limit(1).maybeSingle();
+
+  if(!latestRow){
+    deadEl.innerHTML = `<p class="no-history">No analysis uploaded yet for this warehouse.</p>`;
+    typeEl.innerHTML = `<p class="no-history">No analysis uploaded yet for this warehouse.</p>`;
+    return;
+  }
+
+  const { data: rows } = await sb.from('medicine_analysis_snapshots')
+    .select('*, items(item_name, pack_size)')
+    .eq('warehouse_id', state.currentWarehouse)
+    .eq('snapshot_date', latestRow.snapshot_date);
+
+  const typeCounts = {};
+  (rows||[]).forEach(r => { typeCounts[r.medicine_type] = (typeCounts[r.medicine_type]||0) + 1; });
+  typeEl.innerHTML = `
+    <p class="hint" style="margin-bottom:10px;">From snapshot dated ${latestRow.snapshot_date} (${(rows||[]).length} items).</p>
+    <table class="summary">
+      <tr><th>Type</th><th>Count</th></tr>
+      ${Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]).map(([t,c])=>`<tr><td>${escapeHtml(t||'-')}</td><td>${c}</td></tr>`).join('')}
+    </table>
+  `;
+
+  const dead = (rows||[])
+    .filter(r => ['Dead Stock','No Sale (Slow)','No Sale (Active)'].includes(r.medicine_type))
+    .sort((a,b) => (b.days_since_last_order||0) - (a.days_since_last_order||0))
+    .slice(0, 50);
+  deadEl.innerHTML = !dead.length
+    ? `<p class="no-history">No dead/no-sale items in the latest snapshot.</p>`
+    : `<table class="summary">
+        <tr><th>Item</th><th>Type</th><th>Last order</th><th>Days since</th></tr>
+        ${dead.map(r=>`
+          <tr>
+            <td>${escapeHtml(r.items?.item_name||'')} <span class="mono" style="color:var(--muted); font-size:12px;">${escapeHtml(r.items?.pack_size||'')}</span></td>
+            <td>${escapeHtml(r.medicine_type||'-')}</td>
+            <td>${r.last_order_date||'-'}</td>
+            <td style="color:var(--amber); font-weight:600;">${r.days_since_last_order ?? '-'}</td>
+          </tr>
+        `).join('')}
+      </table>`;
+}
+
+async function fetchAllRows(table, columns){
+  let all = [];
+  let from = 0;
+  const pageSize = 1000;
+  while(true){
+    const { data, error } = await sb.from(table).select(columns).range(from, from + pageSize - 1);
+    if(error || !data || !data.length) break;
+    all = all.concat(data);
+    if(data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
+async function handleAnalysisUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('analysisWarehouseSelect').value;
+  const snapshotDate = document.getElementById('analysisSnapshotDate').value;
+  const resultEl = document.getElementById('analysisUploadResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Processing (this may take a moment for large files)...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    const wb = XLSX.read(evt.target.result, {type:'array'});
+    const sheetName = wb.SheetNames.includes('Medicine Analysis') ? 'Medicine Analysis' : wb.SheetNames[0];
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows found in sheet "${escapeHtml(sheetName)}".</p>`;
+      return;
+    }
+
+    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const nameToItems = {};
+    (itemsData||[]).forEach(i=>{
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return m ? m.id : null;
+      }
+      return null;
+    }
+    const num = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
+
+    let unmatched = 0;
+    const toInsert = [];
+    rows.forEach(r=>{
+      const itemId = resolveItem(r['Medicine Name'], r['Pack Size']);
+      if(!itemId){ unmatched++; return; }
+      toInsert.push({
+        warehouse_id: warehouseId, item_id: itemId, snapshot_date: snapshotDate,
+        medicine_type: r['Medicine Type'], stock_logic: r['Stock Logic'], demand_pattern: r['Demand Pattern'],
+        momentum: r['Momentum (15d vs 30d)'],
+        bills_7d: num(r['Total Bills (7d)']), unique_cust_7d: num(r['Unique Customers (7d)']), qty_7d: num(r['Total Qty Sold (7d)']),
+        bills_15d: num(r['Total Bills (15d)']), unique_cust_15d: num(r['Unique Customers (15d)']), qty_15d: num(r['Total Qty Sold (15d)']),
+        bills_30d: num(r['Total Bills (30d)']), days_sold_30d: num(r['Days Sold (30d)']), qty_30d: num(r['Total Qty Sold (30d)']),
+        clean_qty_30d: num(r['Clean Qty Sold (30d)']), outlier_bills: num(r['Outlier Bills']), max_qty_single_bill: num(r['Max Qty Single Bill']),
+        percentile_95: num(r['Percentile 95']),
+        qty_45d: num(r['Total Qty Sold (45d)']), bills_45d: num(r['Total Bills (45d)']), unique_cust_45d: num(r['Unique Customers (45d)']),
+        qty_60d: num(r['Total Qty Sold (60d)']), bills_60d: num(r['Total Bills (60d)']), unique_cust_60d: num(r['Unique Customers (60d)']),
+        qty_90d: num(r['Total Qty Sold (90d)']), bills_90d: num(r['Total Bills (90d)']), unique_cust_90d: num(r['Unique Customers (90d)']),
+        qty_120d: num(r['Total Qty Sold (120d)']), bills_120d: num(r['Total Bills (120d)']), unique_cust_120d: num(r['Unique Customers (120d)']),
+        qty_180d: num(r['Total Qty Sold (180d)']), bills_180d: num(r['Total Bills (180d)']), unique_cust_180d: num(r['Unique Customers (180d)']),
+        last_order_date: r['Last Order Date'] || null,
+        days_since_last_order: num(r['Days Since Last Order']),
+        daily_avg_30d: num(r['Daily Avg (30d)']), avg_per_days_sold: num(r['Avg per Days Sold']), max_daily_sale: num(r['Max Daily Sale']),
+        unique_cust_30d: num(r['Unique Customers (30d)']), avg_visits_per_cust: num(r['Avg Visits/Customer']),
+        avg_cust_per_day: num(r['Avg Customers Per Day']), same_day_customers: num(r['Same Day Customers']),
+        avg_gap_between_sales_d: num(r['Avg Gap Between Sales (d)']),
+        q1: num(r['Q1']), q3: num(r['Q3']), upper_fence_iqr: num(r['Upper Fence IQR']), outlier_verdict: r['Outlier Verdict'],
+        min_stock: num(r['Min Stock']), max_stock: num(r['Max Stock']), reorder_qty: num(r['Reorder Qty']),
+      });
+    });
+
+    let inserted = 0, lastError = null;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('medicine_analysis_snapshots').insert(chunk);
+      if(!error) inserted += chunk.length; else lastError = error;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${lastError && inserted===0 ? 'var(--red)' : 'var(--green)'};">Done — saved ${inserted} rows for ${snapshotDate}.${unmatched ? ` ${unmatched} rows skipped (item not matched).` : ''}${lastError ? ` Error on some rows: ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+    loadAnalysisSummaries();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ============================================================
+// REFILL NEEDED TAB
+// ============================================================
+function refillTabHTML(){
+  return `
+    <div class="card">
+      <h2>Upload current inventory</h2>
+      <p class="hint">Simple stock snapshot: item name, pack size, current stock. Used to compare against your Min Stock threshold.</p>
+      <label>Warehouse</label>
+      <select id="refillUploadWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload inventory file
+          <input type="file" id="refillInventoryInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: <span class="mono">item name</span>, <span class="mono">pack size</span>, and a <span class="mono">stock</span> column.</p>
+      <div id="refillUploadResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Filters</h2>
+      <div class="grid-2">
+        <div>
+          <label>Warehouse</label>
+          <select id="refillWarehouseSelect">
+            ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label>Medicine type</label>
+          <select id="refillMedType">
+            <option value="">All types</option>
+            <option value="Fast">Fast</option>
+            <option value="Average">Average</option>
+            <option value="Slow">Slow</option>
+          </select>
+        </div>
+        <div>
+          <label>Min unique customers (60d)</label>
+          <input type="number" id="refillMinCust" placeholder="e.g. 5">
+        </div>
+        <div>
+          <label>Min bills (60d)</label>
+          <input type="number" id="refillMinBills" placeholder="e.g. 10">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="applyRefillFiltersBtn">Apply filters</button>
+      </div>
+    </div>
+
+    <div class="card" id="refillSummaryCard" style="display:none; padding:14px 22px;"></div>
+    <div id="refillArea"></div>
+  `;
+}
+
+function initRefillTab(){
+  const input = document.getElementById('refillInventoryInput');
+  if(input) input.addEventListener('change', handleRefillInventoryUpload);
+  const btn = document.getElementById('applyRefillFiltersBtn');
+  if(btn) btn.addEventListener('click', loadRefillNeeded);
+  loadRefillNeeded();
+}
+
+async function handleRefillInventoryUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('refillUploadWarehouseSelect').value;
+  const resultEl = document.getElementById('refillUploadResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+    const cols = Object.keys(rows[0]);
+    const itemCol = cols.find(c=>c.toLowerCase().includes('item') && c.toLowerCase().includes('name')) || cols.find(c=>c.toLowerCase().includes('item'));
+    const packCol = cols.find(c=>c.toLowerCase().includes('pack'));
+    const stockCol = cols.find(c=>c.toLowerCase().includes('stock'));
+
+    if(!itemCol || !stockCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find item name / stock columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+
+    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const nameToItems = {};
+    itemsData.forEach(i=>{
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return m ? m.id : null;
+      }
+      return null;
+    }
+
+    let unmatched = 0;
+    const nowIso = new Date().toISOString();
+    const toInsert = [];
+    rows.forEach(r=>{
+      const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
+      if(!itemId){ unmatched++; return; }
+      toInsert.push({
+        item_id: itemId, warehouse_id: warehouseId, snapshot_at: nowIso,
+        stock_loose: parseFloat(r[stockCol]) || 0, closing_strip: 0,
+      });
+    });
+
+    let inserted = 0, lastError = null;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('inventory_snapshots').insert(chunk);
+      if(!error) inserted += chunk.length; else lastError = error;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${lastError && inserted===0 ? 'var(--red)' : 'var(--green)'};">Done — saved current stock for ${inserted} items.${unmatched ? ` ${unmatched} rows skipped (item not matched).` : ''}${lastError ? ` Error: ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+    loadRefillNeeded();
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function loadRefillNeeded(){
+  const summaryEl = document.getElementById('refillSummaryCard');
+  const areaEl = document.getElementById('refillArea');
+  areaEl.innerHTML = `<div class="card empty-state">Loading...</div>`;
+  summaryEl.style.display = 'none';
+
+  const warehouseId = document.getElementById('refillWarehouseSelect').value;
+  const medType = document.getElementById('refillMedType').value;
+  const minCust = document.getElementById('refillMinCust').value;
+  const minBills = document.getElementById('refillMinBills').value;
+
+  const { data, error } = await sb.rpc('get_refill_needed', {
+    p_warehouse_id: warehouseId,
+    p_med_types: medType ? [medType] : null,
+    p_min_unique_cust_60d: minCust ? parseInt(minCust) : null,
+    p_min_bills_60d: minBills ? parseInt(minBills) : null,
+  });
+
+  if(error || !data || !data.length){
+    areaEl.innerHTML = `<div class="card empty-state">Nothing needs refilling right now given these filters — or no current inventory / analysis data uploaded yet for this warehouse.</div>`;
+    return;
+  }
+
+  const zeroCount = data.filter(r=>r.current_stock === 0).length;
+  summaryEl.style.display = 'block';
+  summaryEl.innerHTML = `<strong>${data.length}</strong> items need refill under current filters — <strong style="color:var(--red);">${zeroCount}</strong> are at zero stock right now.`;
+
+  areaEl.innerHTML = data.map(r=>{
+    const orderStatus = !r.order_placed
+      ? `<span class="badge-warn">Not yet ordered</span>`
+      : r.purchased_since_order
+        ? `<span class="badge-warn" style="background:#E8F4EE; color:var(--green); border-color:#BFE3CE;">Ordered ${new Date(r.last_order_date).toLocaleDateString()} — received</span>`
+        : `<span class="badge-warn" style="background:#FBEAE6; color:var(--red); border-color:#EFC6BA;">Ordered ${new Date(r.last_order_date).toLocaleDateString()} to ${escapeHtml(r.last_order_distributor||'-')} — not yet received</span>`;
+    return `
+      <div class="item-row" style="border-color:${r.current_stock===0 ? 'var(--red)' : 'var(--border)'};">
+        <div class="item-head">
+          <div><span class="item-name">${escapeHtml(r.item_name)}</span> <span class="item-meta">${escapeHtml(r.pack_size||'')} · ${escapeHtml(r.medicine_type||'-')}</span></div>
+          <span class="qty-badge">Stock: ${r.current_stock} / min ${r.min_stock ?? '-'}</span>
+        </div>
+        <p class="no-history">Reorder qty: ${r.reorder_qty ?? '-'} · Unique cust (60d): ${r.unique_cust_60d ?? '-'} · Bills (60d): ${r.bills_60d ?? '-'}</p>
+        ${orderStatus}
+      </div>
+    `;
+  }).join('');
+}
+
+function matchTabHTML(){
+  return `
+    <div class="card">
+      <h2>Convert stock PDF to Excel</h2>
+      <p class="hint">For distributors who send stock as a PDF (Health &amp; Wellness, Shri Radhey, Guru Ji, Sharma Agency, etc.) instead of Excel. Upload the PDF, get back a clean 3-column Excel: Medicine Name, Pack Size, Current Stock — ready to feed into the tools below.</p>
+      <p class="hint" style="color:var(--amber);">Since every distributor's PDF layout differs, this uses a general pattern-matching approach, not a per-distributor template. Spot-check the output before using it — if a particular distributor's format parses badly, share a sample and it can be tuned.</p>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload PDF stock report
+          <input type="file" id="pdfStockInput" accept=".pdf" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <div id="pdfStockResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Upload live stock &amp; price</h2>
+      <p class="hint">For distributors already mapped (like Jeplus, Acorn) — upload their current stock/price file. Only items with an existing mapping will update; anything not yet mapped is skipped and reported, not guessed at.</p>
+      <label>Distributor</label>
+      <select id="stockDistributorSelect" style="max-width:360px; margin-bottom:12px;"></select>
+      <div id="stockFreshnessNote" class="hint" style="margin:-6px 0 12px;"></div>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload stock file
+          <input type="file" id="stockFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: the distributor's own item <span class="mono">code</span>, a <span class="mono">stock</span>/quantity column, and an <span class="mono">MRP</span>/price column.</p>
+      <div id="stockUploadResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Inventory freshness — all distributors</h2>
+      <p class="hint">When stock was last uploaded for each distributor, so the team knows what's current vs. stale.</p>
+      <div id="freshnessTable"></div>
+    </div>
+
+    <div class="card">
+      <h2>Upload a ready-made mapping</h2>
+      <p class="hint">If a distributor has already shared their own item-code mapping (like Jeplus or Acorn did) — a file with <strong>your item code</strong> alongside their code/name — upload it directly here. No review needed, since it's matched by exact code, not guesswork.</p>
+      <label>Distributor</label>
+      <select id="directMapDistributorSelect" style="max-width:360px; margin-bottom:12px;"></select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload mapping file
+          <input type="file" id="directMapFileInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="downloadSampleMappingBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (name doesn't have to match exactly, just needs to contain these words): a column with <span class="mono">code</span> for your item code, and columns for the distributor's own code and name.</p>
+      <div id="directMapResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Or review a raw catalog</h2>
+      <p class="hint">If you only have a distributor's raw stock list (no mapping to your codes yet), use the matcher below — it suggests candidates for you to confirm, one by one or in bulk via Excel.</p>
+      <label>Distributor</label>
+      <select id="matchDistributorSelect" style="max-width:360px;"></select>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="exportCandidatesBtn" style="display:none;">Download all as Excel</button>
+        <label class="btn btn-ghost" style="position:relative; display:none;" id="uploadDecisionsWrap">
+          Upload decisions
+          <input type="file" id="uploadDecisionsInput" accept=".xlsx,.xls,.csv" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+    </div>
+    <div id="matchArea"></div>
+  `;
+}
+
+async function loadMatchDistributors(){
+  const pdfStockInput = document.getElementById('pdfStockInput');
+  if(pdfStockInput) pdfStockInput.addEventListener('change', handlePdfStockUpload);
+
+  const { data } = await sb.from('distributors').select('id, name').order('name');
+  matchState.distributors = data || [];
+
+  const stockSel = document.getElementById('stockDistributorSelect');
+  if(stockSel){
+    stockSel.innerHTML = `<option value="">Select a distributor...</option>` +
+      matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+    stockSel.addEventListener('change', async (e)=>{
+      const note = document.getElementById('stockFreshnessNote');
+      if(!e.target.value){ note.textContent = ''; return; }
+      note.textContent = 'Checking last upload...';
+      const { data } = await sb.from('distributor_inventory_freshness').select('*').eq('distributor_id', e.target.value).maybeSingle();
+      if(data && data.last_updated){
+        const d = new Date(data.last_updated);
+        note.innerHTML = `Last uploaded: <strong>${d.toLocaleString()}</strong> · ${data.items_tracked} items tracked`;
+      } else {
+        note.innerHTML = `<span style="color:var(--amber);">No stock uploaded yet for this distributor.</span>`;
+      }
+    });
+  }
+  loadFreshnessTable();
+
+  const stockFileInput = document.getElementById('stockFileInput');
+  if(stockFileInput) stockFileInput.addEventListener('change', handleStockUpload);
+
+  const directSel = document.getElementById('directMapDistributorSelect');
+  if(directSel){
+    directSel.innerHTML = `<option value="">Select a distributor...</option>` +
+      matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  }
+  const directFileInput = document.getElementById('directMapFileInput');
+  if(directFileInput) directFileInput.addEventListener('change', handleDirectMapUpload);
+
+  const sel = document.getElementById('matchDistributorSelect');
+  if(!sel) return;
+  sel.innerHTML = `<option value="">Select a distributor...</option>` +
+    matchState.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  sel.addEventListener('change', async (e)=>{
+    matchState.currentDistributor = e.target.value;
+    matchState.reviewedCount = 0;
+    const hasDistributor = !!matchState.currentDistributor;
+    document.getElementById('exportCandidatesBtn').style.display = hasDistributor ? 'inline-flex' : 'none';
+    document.getElementById('uploadDecisionsWrap').style.display = hasDistributor ? 'inline-flex' : 'none';
+    if(hasDistributor) await loadMatchBatch();
+    else document.getElementById('matchArea').innerHTML = '';
+  });
+  document.getElementById('exportCandidatesBtn').addEventListener('click', exportCandidatesToExcel);
+  document.getElementById('uploadDecisionsInput').addEventListener('change', uploadDecisionsFile);
+}
+
+// ============================================================
+// PDF STOCK REPORT -> EXCEL CONVERTER
+// ============================================================
+const KNOWN_UNITS = ['pcs','tab','tabs','strp','cap','caps','ml','syp','amp','drop','vial','inj','tube','crea','sch','kit'];
+const SKIP_LINE_PATTERNS = [
+  /total\b/i, /page no/i, /continued/i, /gstin/i, /closing stock/i, /^s\.?no\.?\s/i,
+  /^phone\s*:/i, /end of report/i, /^-{5,}/, /e-mail/i,
+];
+
+function isSkippableLine(line){
+  const trimmed = line.trim();
+  if(!trimmed) return true;
+  return SKIP_LINE_PATTERNS.some(p => p.test(trimmed));
+}
+
+function parsePdfLine(line){
+  // strip a leading serial number, if present
+  let working = line.trim().replace(/^\d+\s+/, '');
+  const tokens = working.split(/\s+/).filter(Boolean);
+  if(tokens.length < 3) return null;
+
+  const last = tokens[tokens.length - 1].toLowerCase().replace(/[^a-z]/g, '');
+  const isUnitLike = KNOWN_UNITS.includes(last) || (last.length <= 5 && /^[a-z]+$/.test(last));
+  if(!isUnitLike) return null;
+
+  const stockToken = tokens[tokens.length - 2];
+  const stockMatch = stockToken.match(/^-?\d+$/);
+  if(!stockMatch) return null;
+  const stock = parseInt(stockToken, 10);
+
+  const remaining = tokens.slice(0, tokens.length - 2);
+  if(remaining.length < 2) return null;
+
+  // pack size: the last remaining token if it looks like a pack (has a digit)
+  const lastRemaining = remaining[remaining.length - 1];
+  const looksLikePack = /\d/.test(lastRemaining);
+  let pack = '', nameTokens = remaining;
+  if(looksLikePack){
+    pack = lastRemaining;
+    nameTokens = remaining.slice(0, remaining.length - 1);
+  }
+  const name = nameTokens.join(' ').trim();
+  if(!name) return null;
+
+  return { name, pack, stock };
+}
+
+async function handlePdfStockUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('pdfStockResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Reading PDF...</p>`;
+
+  try{
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    const rows = [];
+    for(let pageNum = 1; pageNum <= pdf.numPages; pageNum++){
+      const page = await pdf.getPage(pageNum);
+      const content = await page.getTextContent();
+
+      // group text items into lines by y-position
+      const lineMap = new Map();
+      content.items.forEach(item => {
+        const y = Math.round(item.transform[5]);
+        if(!lineMap.has(y)) lineMap.set(y, []);
+        lineMap.get(y).push(item);
+      });
+
+      const sortedYs = Array.from(lineMap.keys()).sort((a,b) => b - a);
+      sortedYs.forEach(y => {
+        const items = lineMap.get(y).sort((a,b) => a.transform[4] - b.transform[4]);
+        const lineText = items.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
+        if(isSkippableLine(lineText)) return;
+        const parsed = parsePdfLine(lineText);
+        if(parsed) rows.push(parsed);
+      });
+    }
+
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't extract any stock rows from this PDF. The layout may be too different from what this parser expects — share a sample and it can be tuned.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const excelRows = rows.map(r => ({ 'Medicine Name': r.name, 'Pack Size': r.pack, 'Current Stock': r.stock }));
+    const ws = XLSX.utils.json_to_sheet(excelRows);
+    ws['!autofilter'] = { ref: ws['!ref'] };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Stock');
+    const outName = file.name.replace(/\.pdf$/i, '') + '_converted.xlsx';
+    XLSX.writeFile(wb, outName);
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — extracted ${rows.length} rows into ${escapeHtml(outName)}. Please spot-check a few rows against the original PDF before using this.</p>`;
+    e.target.value = '';
+  } catch(err){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't read this PDF: ${escapeHtml(err.message)}</p>`;
+    e.target.value = '';
+  }
+}
+
+async function loadFreshnessTable(){
+  const el = document.getElementById('freshnessTable');
+  if(!el) return;
+  el.innerHTML = `<p class="no-history">Loading...</p>`;
+
+  const { data: freshness } = await sb.from('distributor_inventory_freshness').select('*');
+  const freshByDist = Object.fromEntries((freshness||[]).map(f=>[f.distributor_id, f]));
+
+  const rows = matchState.distributors.map(d=>{
+    const f = freshByDist[d.id];
+    return { name: d.name, last_updated: f?.last_updated || null, items_tracked: f?.items_tracked || 0 };
+  }).sort((a,b)=>{
+    if(!a.last_updated && !b.last_updated) return a.name.localeCompare(b.name);
+    if(!a.last_updated) return 1;
+    if(!b.last_updated) return -1;
+    return new Date(b.last_updated) - new Date(a.last_updated);
+  });
+
+  el.innerHTML = `
+    <table class="summary">
+      <tr><th>Distributor</th><th>Last uploaded</th><th>Items tracked</th></tr>
+      ${rows.map(r=>`
+        <tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td>${r.last_updated ? new Date(r.last_updated).toLocaleString() : '<span style="color:var(--amber);">Never</span>'}</td>
+          <td>${r.items_tracked}</td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
+}
+
+async function handleStockUpload(e){
+  const file = e.target.files[0];
+  const distributorId = document.getElementById('stockDistributorSelect').value;
+  const resultEl = document.getElementById('stockUploadResult');
+  if(!file) return;
+  if(!distributorId){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please select a distributor first.</p>`;
+    e.target.value = '';
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const allCols = Object.keys(rows[0]);
+    const codeCol = allCols.find(k => k.toLowerCase().includes('code'));
+    const stockCol = allCols.find(k => k.toLowerCase().includes('stock') || k.toLowerCase().includes('qty') || k.toLowerCase().includes('available'));
+    const priceCol = allCols.find(k => k.toLowerCase().includes('mrp') || k.toLowerCase().includes('price'));
+
+    if(!codeCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a code column. Columns found: ${allCols.join(', ')}</p>`;
+      return;
+    }
+
+    // look up existing mapping for this distributor by their own code
+    const { data: mapData } = await sb.from('item_distributor_map')
+      .select('item_id, distributor_item_code')
+      .eq('distributor_id', distributorId);
+    const codeToItemId = Object.fromEntries((mapData||[]).map(m=>[String(m.distributor_item_code).trim(), m.item_id]));
+
+    const toInsert = [];
+    let unmapped = 0;
+    for(const r of rows){
+      const code = String(r[codeCol]).trim();
+      const itemId = codeToItemId[code];
+      if(!itemId){ unmapped++; continue; }
+      toInsert.push({
+        distributor_id: distributorId,
+        item_id: itemId,
+        quantity_available: stockCol ? parseInt(r[stockCol]) || 0 : null,
+        price: priceCol ? parseFloat(r[priceCol]) || null : null,
+      });
+    }
+
+    let inserted = 0;
+    let lastError = null;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('distributor_inventory').insert(chunk);
+      if(!error) inserted += chunk.length;
+      else lastError = error;
+    }
+
+    if(inserted === 0 && lastError){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Upload failed — nothing was saved. Error: ${escapeHtml(lastError.message)}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — stock updated for ${inserted} mapped items.${unmapped ? ` ${unmapped} rows were skipped (not yet mapped for this distributor — use the mapping tool above first, or the catalog matcher below).` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+    loadFreshnessTable();
+    document.getElementById('stockDistributorSelect').dispatchEvent(new Event('change'));
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function handleDirectMapUpload(e){
+  const file = e.target.files[0];
+  const distributorId = document.getElementById('directMapDistributorSelect').value;
+  const resultEl = document.getElementById('directMapResult');
+  if(!file) return;
+  if(!distributorId){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please select a distributor first.</p>`;
+    e.target.value = '';
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const allCols = Object.keys(rows[0]);
+    const codeCol = allCols.find(k => k.toLowerCase().includes('rio') && k.toLowerCase().includes('code'))
+      || allCols.find(k => ['code','item code','itemcode','our code','rapidsurge code'].includes(k.toLowerCase()));
+    const distCodeCol = allCols.find(k => k.toLowerCase().includes('code') && k !== codeCol);
+    const distNameCol = allCols.find(k => k.toLowerCase().includes('name') && !k.toLowerCase().includes('rio'));
+
+    if(!codeCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a column for your item code. Columns found: ${Object.keys(rows[0]).join(', ')}</p>`;
+      return;
+    }
+
+    const codes = rows.map(r=>String(r[codeCol]).trim());
+    let itemsData = [];
+    for(let i=0; i<codes.length; i+=500){
+      const chunk = codes.slice(i, i+500);
+      const { data } = await sb.from('items').select('id, code').in('code', chunk);
+      if(data) itemsData = itemsData.concat(data);
+    }
+    const codeToId = Object.fromEntries(itemsData.map(i=>[i.code, i.id]));
+
+    const mappedRaw = rows.map(r=>({
+      item_id: codeToId[String(r[codeCol]).trim()],
+      distributor_id: distributorId,
+      distributor_item_code: distCodeCol ? String(r[distCodeCol]) : null,
+      distributor_item_name: distNameCol ? String(r[distNameCol]) : null,
+    })).filter(r=>r.item_id);
+
+    const unmatchedCount = rows.length - mappedRaw.length;
+
+    // dedupe by item_id — keep the last occurrence if the same item appears
+    // more than once in the file (Postgres can't apply two updates to the
+    // same row in one batch)
+    const dedupeMap = new Map();
+    mappedRaw.forEach(r => dedupeMap.set(r.item_id, r));
+    const mapped = Array.from(dedupeMap.values());
+    const duplicateCount = mappedRaw.length - mapped.length;
+
+    // check how many of these already have a mapping for this distributor
+    const mappedItemIds = mapped.map(m=>m.item_id);
+    let existingCount = 0;
+    for(let i=0; i<mappedItemIds.length; i+=500){
+      const chunk = mappedItemIds.slice(i, i+500);
+      const { count } = await sb.from('item_distributor_map')
+        .select('item_id', { count: 'exact', head: true })
+        .eq('distributor_id', distributorId)
+        .in('item_id', chunk);
+      existingCount += count || 0;
+    }
+
+    if(existingCount > 0){
+      const proceed = confirm(
+        `${existingCount} of these ${mapped.length} items are already mapped for this distributor. ` +
+        `Uploading will overwrite their existing mapping with this new file's data.\n\nContinue?`
+      );
+      if(!proceed){
+        resultEl.innerHTML = `<p class="no-history">Upload cancelled — no changes made.</p>`;
+        e.target.value = '';
+        return;
+      }
+    }
+
+    let inserted = 0;
+    let lastError = null;
+    for(let i=0; i<mapped.length; i+=500){
+      const chunk = mapped.slice(i, i+500);
+      const { error } = await sb.from('item_distributor_map').upsert(chunk, { onConflict: 'item_id,distributor_id' });
+      if(!error) inserted += chunk.length;
+      else lastError = error;
+    }
+
+    if(inserted === 0 && lastError){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Upload failed — nothing was saved. Error: ${escapeHtml(lastError.message)}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${inserted} items mapped successfully${existingCount ? ` (${existingCount} were updates to existing mappings)` : ''}.${unmatchedCount ? ` ${unmatchedCount} rows couldn't be matched to your item codes and were skipped.` : ''}${duplicateCount ? ` ${duplicateCount} duplicate rows (same item appearing twice in the file) were collapsed to one.` : ''}${lastError ? ` Note: some rows failed — ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function fetchAllPendingCandidates(distributorId){
+  let all = [];
+  let from = 0;
+  const pageSize = 1000;
+  while(true){
+    const { data, error } = await sb.from('distributor_match_candidates')
+      .select('*')
+      .eq('distributor_id', distributorId)
+      .eq('status', 'pending')
+      .order('item_id')
+      .range(from, from + pageSize - 1);
+    if(error || !data || !data.length) break;
+    all = all.concat(data);
+    if(data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
+async function exportCandidatesToExcel(){
+  const btn = document.getElementById('exportCandidatesBtn');
+  btn.disabled = true; btn.textContent = 'Preparing export...';
+  const candidates = await fetchAllPendingCandidates(matchState.currentDistributor);
+  const itemIds = [...new Set(candidates.map(c=>c.item_id))];
+  let itemsData = [];
+  for(let i=0; i<itemIds.length; i+=500){
+    const chunk = itemIds.slice(i, i+500);
+    const { data } = await sb.from('items').select('id, item_name, pack_size, code').in('id', chunk);
+    if(data) itemsData = itemsData.concat(data);
+  }
+  const itemById = Object.fromEntries(itemsData.map(i=>[i.id, i]));
+
+  const rows = candidates.map(c=>{
+    const item = itemById[c.item_id] || {};
+    return {
+      'candidate_id': c.id,
+      'item_id': c.item_id,
+      'Item Name': item.item_name || '',
+      'Pack Size': item.pack_size || '',
+      'Item Code': item.code || '',
+      'Candidate Code': c.candidate_code,
+      'Candidate Name': c.candidate_name,
+      'Candidate Pack': c.candidate_pack,
+      'MRP': c.candidate_mrp,
+      'Stock': c.candidate_stock,
+      'Match %': c.score,
+      'Decision (write CONFIRM or NO MATCH)': '',
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!autofilter'] = { ref: ws['!ref'] };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Matches');
+  const distName = matchState.distributors.find(d=>d.id===matchState.currentDistributor)?.name || 'distributor';
+  XLSX.writeFile(wb, `Match_Review_${distName}_${new Date().toISOString().slice(0,10)}.xlsx`);
+  btn.disabled = false; btn.textContent = 'Download all as Excel';
+}
+
+async function uploadDecisionsFile(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    const wb = XLSX.read(evt.target.result, {type:'array'});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet);
+
+    const decisionKey = Object.keys(rows[0]||{}).find(k=>k.toLowerCase().startsWith('decision')) || 'Decision (write CONFIRM or NO MATCH)';
+
+    const confirmed = rows.filter(r => String(r[decisionKey]||'').trim().toUpperCase() === 'CONFIRM');
+    const noMatchItemIds = new Set(
+      rows.filter(r => String(r[decisionKey]||'').trim().toUpperCase().includes('NO MATCH')).map(r=>r.item_id)
+    );
+
+    let confirmedCount = 0, rejectedCount = 0;
+    for(const r of confirmed){
+      await sb.from('item_distributor_map').upsert({
+        item_id: r.item_id,
+        distributor_id: matchState.currentDistributor,
+        distributor_item_code: r['Candidate Code'],
+        distributor_item_name: r['Candidate Name'],
+      }, { onConflict: 'item_id,distributor_id' });
+      await sb.from('distributor_inventory').insert({
+        distributor_id: matchState.currentDistributor,
+        item_id: r.item_id,
+        quantity_available: r['Stock'],
+        price: r['MRP'],
+      });
+      await sb.from('distributor_match_candidates').update({ status: 'confirmed' }).eq('id', r.candidate_id);
+      confirmedCount++;
+    }
+    // reject all remaining pending candidates for confirmed or no-match items
+    const resolvedItemIds = [...new Set([...confirmed.map(r=>r.item_id), ...noMatchItemIds])];
+    for(let i=0; i<resolvedItemIds.length; i+=200){
+      const chunk = resolvedItemIds.slice(i, i+200);
+      await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+        .eq('distributor_id', matchState.currentDistributor)
+        .eq('status', 'pending')
+        .in('item_id', chunk);
+    }
+    rejectedCount = noMatchItemIds.size;
+
+    alert(`Applied: ${confirmedCount} confirmed, ${rejectedCount} marked no-match. Reloading list...`);
+    await loadMatchBatch();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+async function loadMatchBatch(){
+  matchState.loading = true;
+  document.getElementById('matchArea').innerHTML = `<div class="card empty-state">Loading candidates...</div>`;
+
+  const { count } = await sb.from('distributor_match_candidates')
+    .select('item_id', { count: 'exact', head: true })
+    .eq('distributor_id', matchState.currentDistributor)
+    .eq('status', 'pending');
+  matchState.totalPending = count || 0;
+
+  const { data } = await sb.from('distributor_match_candidates')
+    .select('*')
+    .eq('distributor_id', matchState.currentDistributor)
+    .eq('status', 'pending')
+    .order('item_id')
+    .order('score', { ascending: false })
+    .limit(60); // ~20 items worth of candidates (up to 3 each)
+
+  if(!data || !data.length){
+    matchState.currentBatch = [];
+    renderMatchArea();
+    matchState.loading = false;
+    return;
+  }
+
+  const itemIds = [...new Set(data.map(d=>d.item_id))];
+  const { data: itemsData } = await sb.from('items').select('id, item_name, pack_size, code').in('id', itemIds);
+  const itemById = Object.fromEntries((itemsData||[]).map(i=>[i.id, i]));
+
+  const grouped = {};
+  data.forEach(c=>{
+    if(!grouped[c.item_id]) grouped[c.item_id] = { item: itemById[c.item_id], candidates: [] };
+    grouped[c.item_id].candidates.push(c);
+  });
+  matchState.currentBatch = Object.values(grouped);
+  matchState.loading = false;
+  renderMatchArea();
+}
+
+function renderMatchArea(){
+  const el = document.getElementById('matchArea');
+  if(!matchState.currentDistributor){ el.innerHTML=''; return; }
+  if(!matchState.currentBatch.length){
+    el.innerHTML = `<div class="card empty-state">No pending candidates left for this distributor — all reviewed, or none uploaded yet.</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="card" style="padding:14px 22px;">
+      <strong>${matchState.totalPending}</strong> items awaiting review for this distributor.
+    </div>
+    ${matchState.currentBatch.map(group => matchItemHTML(group)).join('')}
+  `;
+  document.querySelectorAll('[data-confirm-candidate]').forEach(btn=>{
+    btn.addEventListener('click', ()=>confirmMatch(btn.dataset.confirmCandidate, btn.dataset.itemId));
+  });
+  document.querySelectorAll('[data-reject-item]').forEach(btn=>{
+    btn.addEventListener('click', ()=>rejectItem(btn.dataset.rejectItem));
+  });
+}
+
+function matchItemHTML(group){
+  const item = group.item;
+  if(!item) return '';
+  return `
+    <div class="item-row">
+      <div class="item-head">
+        <div><span class="item-name">${escapeHtml(item.item_name)}</span> <span class="item-meta">${escapeHtml(item.pack_size||'')} · ${escapeHtml(item.code)}</span></div>
+        <button class="btn btn-ghost" style="padding:6px 12px; font-size:12.5px;" data-reject-item="${item.id}">No match — skip</button>
+      </div>
+      <div class="ladder">
+        ${group.candidates.map(c=>`
+          <div class="ladder-item">
+            <div style="flex:1;">
+              <div class="ladder-dist">${escapeHtml(c.candidate_name)} <span class="mono" style="color:var(--muted); font-weight:400;">${escapeHtml(c.candidate_pack||'')}</span></div>
+              <div class="ladder-stats">code ${escapeHtml(c.candidate_code)} · MRP ₹${c.candidate_mrp||'-'} · stock ${c.candidate_stock??'-'} · match ${c.score}%</div>
+            </div>
+            <button class="btn btn-primary" style="padding:7px 14px; font-size:12.5px;" data-confirm-candidate="${c.id}" data-item-id="${item.id}">Confirm match</button>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function confirmMatch(candidateId, itemId){
+  const candidate = matchState.currentBatch.flatMap(g=>g.candidates).find(c=>c.id===candidateId);
+  if(!candidate) return;
+
+  await sb.from('item_distributor_map').upsert({
+    item_id: itemId,
+    distributor_id: matchState.currentDistributor,
+    distributor_item_code: candidate.candidate_code,
+    distributor_item_name: candidate.candidate_name,
+  }, { onConflict: 'item_id,distributor_id' });
+
+  await sb.from('distributor_inventory').insert({
+    distributor_id: matchState.currentDistributor,
+    item_id: itemId,
+    quantity_available: candidate.candidate_stock,
+    price: candidate.candidate_mrp,
+  });
+
+  await sb.from('distributor_match_candidates').update({ status: 'confirmed' }).eq('id', candidateId);
+  await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+    .eq('item_id', itemId).eq('distributor_id', matchState.currentDistributor).eq('status', 'pending');
+
+  matchState.currentBatch = matchState.currentBatch.filter(g => g.item.id !== itemId);
+  matchState.totalPending = Math.max(0, matchState.totalPending - 1);
+  if(matchState.currentBatch.length < 5) await loadMatchBatch();
+  else renderMatchArea();
+}
+
+async function rejectItem(itemId){
+  await sb.from('distributor_match_candidates').update({ status: 'rejected' })
+    .eq('item_id', itemId).eq('distributor_id', matchState.currentDistributor).eq('status', 'pending');
+  matchState.currentBatch = matchState.currentBatch.filter(g => g.item.id !== itemId);
+  matchState.totalPending = Math.max(0, matchState.totalPending - 1);
+  if(matchState.currentBatch.length < 5) await loadMatchBatch();
+  else renderMatchArea();
+}
+
+// ============================================================
+// ADMIN TAB
+// ============================================================
+function adminTabHTML(){
+  return `
+    <div class="grid-2">
+      <div class="card">
+        <h2>Add warehouse</h2>
+        <p class="hint">Adds a new warehouse. It'll appear in the warehouse selector immediately.</p>
+        <form id="addWarehouseForm">
+          <div class="field"><label>Warehouse name</label><input type="text" id="newWhName" required></div>
+          <div class="field"><label>Location (optional)</label><input type="text" id="newWhLocation"></div>
+          <button class="btn btn-primary" type="submit">Add warehouse</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Add distributor</h2>
+        <p class="hint">New distributors won't appear in suggestions until they have purchase history — but they're now available to select manually.</p>
+        <form id="addDistributorForm">
+          <div class="field"><label>Distributor name</label><input type="text" id="newDistName" required></div>
+          <div class="field"><label>Phone (optional)</label><input type="text" id="newDistPhone"></div>
+          <div class="field">
+            <label>Serves warehouse</label>
+            <select id="newDistWarehouse">
+              ${state.warehouses.map(w=>`<option value="${w.id}">${w.name}</option>`).join('')}
+            </select>
+          </div>
+          <button class="btn btn-primary" type="submit">Add distributor</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Warehouses</h2>
+      <ul class="admin-list">
+        ${state.warehouses.map(w=>`<li><span>${escapeHtml(w.name)}</span><span class="mono" style="color:var(--muted); font-size:12px;">${w.id.slice(0,8)}</span></li>`).join('')}
+      </ul>
+    </div>
+  `;
+}
+
+async function handleAddWarehouse(e){
+  e.preventDefault();
+  const name = document.getElementById('newWhName').value.trim();
+  const location = document.getElementById('newWhLocation').value.trim();
+  if(!name) return;
+  const { error } = await sb.from('warehouses').insert({ name, location });
+  if(error){ alert('Could not add warehouse: ' + error.message); return; }
+  await loadWarehouses();
+  renderMain();
+  state.activeTab = 'admin';
+  renderTabContent();
+}
+
+async function handleAddDistributor(e){
+  e.preventDefault();
+  const name = document.getElementById('newDistName').value.trim();
+  const phone = document.getElementById('newDistPhone').value.trim();
+  const warehouseId = document.getElementById('newDistWarehouse').value;
+  if(!name) return;
+  const { data, error } = await sb.from('distributors').insert({ name, phone }).select().single();
+  if(error){ alert('Could not add distributor: ' + error.message); return; }
+  await sb.from('distributor_warehouses').insert({ distributor_id: data.id, warehouse_id: warehouseId });
+  alert('Distributor added.');
+  e.target.reset();
+}
+
+// ============================================================
+// SAMPLE FORMAT DOWNLOADS
+// ============================================================
+function downloadSampleOrderFormat(){
+  const rows = [
+    { 'Item': 'Acitrom 1 Tablet', 'Pack Size': '30 Tablet', 'Qty': 20 },
+    { 'Item': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Qty': 10 },
+    { 'Item': 'M00010K', 'Pack Size': '', 'Qty': 10 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Order');
+  XLSX.writeFile(wb, 'sample_order_format.xlsx');
+}
+
+function downloadSampleMappingFormat(){
+  const rows = [
+    { 'Rio Code': 'M0000Z2', 'Rio Medicine Name': 'Acitrom 1 Tablet', 'Rio Pack Size': '30 Tablet',
+      'Distributor Code': '4330', 'Distributor Medicine Name': 'ACITROM 1MG', 'Distributor Pack Size': '30S' },
+    { 'Rio Code': 'M0008HC', 'Rio Medicine Name': 'Pan D Capsule', 'Rio Pack Size': '15 Capsules',
+      'Distributor Code': '8869', 'Distributor Medicine Name': 'PAN D CAP', 'Distributor Pack Size': '15S' },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Mapping');
+  XLSX.writeFile(wb, 'sample_mapping_format.xlsx');
+}
+
+// ============================================================
+// UTIL
+// ============================================================
+function escapeHtml(str){
+  if(str === null || str === undefined) return '';
+  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ============================================================
+// INIT — check existing session
+// ============================================================
+(async function init(){
+  const { data } = await sb.auth.getSession();
+  if(data.session){
+    state.session = data.session;
+    await loadWarehouses();
+  }
+  render();
+})();
+</script>
+</body>
+</html>
