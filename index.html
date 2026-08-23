@@ -9,6 +9,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <style>
   :root{
     --ink:#1C2B2B;
@@ -2355,49 +2356,93 @@ async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
     const mid = Math.floor(nums.length/2);
     return nums.length % 2 ? nums[mid] : Math.round(((nums[mid-1]+nums[mid])/2)*100)/100;
   }
-  function cellFor(best){
+  function cellTextFor(best){
     const parts = [];
     const sch = best.Scheme && String(best.Scheme).trim() ? String(best.Scheme).trim() : '—';
     parts.push(sch);
     if(best.Margin !== undefined && best.Margin !== null && best.Margin !== '') parts.push(`Mgn ${best.Margin}%`);
     if(best.Stock !== undefined && best.Stock !== null && best.Stock !== '') parts.push(`Qty ${best.Stock}`);
-    return parts.join(' | ');
+    return parts.join('\n');
   }
 
-  const compareRows = meds.map(med => {
+  // compareCells: one row per medicine, each cell holds {text, margin} per distributor
+  const compareCells = meds.map(med => {
     const inpack = packMap[med] || '';
     const g = detailRows.filter(r => r.SearchTerm === med);
-    const row = { 'Med Name': med, 'Pack Size': inpack, 'Company': '', 'MRP': '', 'PTR (typical)': '' };
+    const base_row = { 'Med Name': med, 'Pack Size': inpack, 'Company': '', 'MRP': '', 'PTR (typical)': '' };
+    const distCells = {};
     if(!g.length){
-      distributors.forEach(d => row[d] = '');
-      return row;
+      distributors.forEach(d => distCells[d] = null);
+      return { ...base_row, distCells };
     }
     const form = pr_inputForm(inpack);
     const icount = form === 'SOLID' ? pr_inputCount(inpack) : null;
     const filtered = g.filter(r => pr_packMatches(r.Pack, form, icount));
     const base = filtered.length ? filtered : g;
-    row['Company'] = modeOrFirst(base.map(r => r.Company));
-    row['MRP'] = modeOrFirst(base.map(r => r.MRP));
-    row['PTR (typical)'] = medianOf(base.map(r => r.PTR));
+    base_row['Company'] = modeOrFirst(base.map(r => r.Company));
+    base_row['MRP'] = modeOrFirst(base.map(r => r.MRP));
+    base_row['PTR (typical)'] = medianOf(base.map(r => r.PTR));
     distributors.forEach(d => {
       let sub = base.filter(r => r.Distributor === d);
       if(!sub.length) sub = g.filter(r => r.Distributor === d);
-      if(!sub.length){ row[d] = ''; return; }
+      if(!sub.length){ distCells[d] = null; return; }
       sub.sort((a,b) => (parseFloat(b.Margin)||-Infinity) - (parseFloat(a.Margin)||-Infinity));
-      row[d] = cellFor(sub[0]);
+      const top = sub[0];
+      const marginVal = parseFloat(top.Margin);
+      distCells[d] = { text: cellTextFor(top), margin: isNaN(marginVal) ? null : marginVal };
     });
-    return row;
+    return { ...base_row, distCells };
   });
 
-  const wb = XLSX.utils.book_new();
-  const wsCompare = XLSX.utils.json_to_sheet(compareRows);
-  XLSX.utils.book_append_sheet(wb, wsCompare, 'Compare');
-  const wsDetails = XLSX.utils.json_to_sheet(detailRows);
-  XLSX.utils.book_append_sheet(wb, wsDetails, 'Details');
-  XLSX.writeFile(wb, `pharmarack_search_${new Date().toISOString().slice(0,10)}.xlsx`);
+  // ---- build workbook with ExcelJS (supports real cell colors + wrap text) ----
+  const workbook = new ExcelJS.Workbook();
+  const compareSheet = workbook.addWorksheet('Compare');
+  const headerRow = ['Med Name', 'Pack Size', 'Company', 'MRP', 'PTR (typical)', ...distributors];
+  compareSheet.addRow(headerRow);
+  compareSheet.getRow(1).font = { bold: true };
+  compareSheet.columns = headerRow.map((h, idx) => ({ width: idx < 5 ? 20 : 22 }));
 
-  const matchedCount = compareRows.filter(r => distributors.some(d => r[d])).length;
-  resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${meds.length} medicines searched, ${matchedCount} had matches across ${distributors.length} distributors, ${zeroHits.length} had no match. Downloaded as Excel.</p>${zeroHits.length ? `<p class="no-history">No match: ${escapeHtml(zeroHits.join(', '))}</p>` : ''}`;
+  const GREEN = 'FFC6EFCE', ORANGE = 'FFFFD9A0', YELLOW = 'FFFFF2A8';
+
+  compareCells.forEach(row => {
+    const rowValues = [row['Med Name'], row['Pack Size'], row['Company'], row['MRP'], row['PTR (typical)'],
+      ...distributors.map(d => row.distCells[d] ? row.distCells[d].text : '')];
+    const excelRow = compareSheet.addRow(rowValues);
+    excelRow.eachCell((cell, colNumber) => {
+      if(colNumber > 5) cell.alignment = { wrapText: true, vertical: 'top' };
+    });
+
+    // rank this row's distributors by margin, color top 3
+    const ranked = distributors
+      .map((d, i) => ({ d, i, margin: row.distCells[d] ? row.distCells[d].margin : null }))
+      .filter(x => x.margin !== null)
+      .sort((a, b) => b.margin - a.margin);
+
+    const colors = [GREEN, ORANGE, YELLOW];
+    ranked.slice(0, 3).forEach((entry, rank) => {
+      const colIndex = 5 + entry.i + 1; // +1 because ExcelJS columns are 1-indexed
+      const cell = excelRow.getCell(colIndex);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors[rank] } };
+    });
+  });
+
+  const detailSheet = workbook.addWorksheet('Details');
+  const detailHeaders = ['Medicine','Distributor','Company','MRP','PTR','Pack','Scheme','Stock','Margin','NetRate','InputPack','SearchTerm'];
+  detailSheet.addRow(detailHeaders);
+  detailSheet.getRow(1).font = { bold: true };
+  detailRows.forEach(r => detailSheet.addRow(detailHeaders.map(h => r[h])));
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  const blob = new Blob([buffer], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `pharmarack_search_${new Date().toISOString().slice(0,10)}.xlsx`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  const matchedCount = compareCells.filter(r => distributors.some(d => r.distCells[d])).length;
+  resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${meds.length} medicines searched, ${matchedCount} had matches across ${distributors.length} distributors, ${zeroHits.length} had no match. Best margin per item highlighted green (1st), orange (2nd), yellow (3rd). Downloaded as Excel.</p>${zeroHits.length ? `<p class="no-history">No match: ${escapeHtml(zeroHits.join(', '))}</p>` : ''}`;
 }
 
 // ============================================================
