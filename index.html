@@ -395,6 +395,12 @@ function attachTabHandlers(){
 
   const testPharmarackBtn = document.getElementById('testPharmarackBtn');
   if(testPharmarackBtn) testPharmarackBtn.addEventListener('click', testPharmarackConnection);
+
+  const pharmarackListInput = document.getElementById('pharmarackListInput');
+  if(pharmarackListInput) pharmarackListInput.addEventListener('change', handlePharmarackSearchUpload);
+
+  const downloadSamplePharmarackBtn = document.getElementById('downloadSamplePharmarackBtn');
+  if(downloadSamplePharmarackBtn) downloadSamplePharmarackBtn.addEventListener('click', downloadSamplePharmarackFormat);
 }
 
 function handleFileUpload(e){
@@ -1246,6 +1252,22 @@ async function loadRefillNeeded(){
 function matchTabHTML(){
   return `
     <div class="card">
+      <h2>Search Pharmarack (multi-distributor)</h2>
+      <p class="hint">Upload an item list (Item Name, Pack Size) — checks Pharmarack's listing across many distributors at once, matching by brand + strength + form. Output is a downloadable Excel only — nothing is saved to your live data automatically.</p>
+      <label>Pharmarack cURL (paste fresh each session — copy from your browser's Network tab while searching on Pharmarack)</label>
+      <textarea id="pharmarackSearchCurl" placeholder="curl 'https://...' -H '...' --data-raw '...'" style="min-height:100px;"></textarea>
+      <div class="btn-row" style="margin-top:10px;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload item list
+          <input type="file" id="pharmarackListInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="downloadSamplePharmarackBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: <span class="mono">Med Name</span> (or Item Name), <span class="mono">Pack Size</span>.</p>
+      <div id="pharmarackSearchResult"></div>
+    </div>
+
+    <div class="card">
       <h2>Convert stock PDF to Excel</h2>
       <p class="hint">For distributors who send stock as a PDF (Health &amp; Wellness, Shri Radhey, Guru Ji, Sharma Agency, etc.) instead of Excel. Upload the PDF, get back a clean 3-column Excel: Medicine Name, Pack Size, Current Stock — ready to feed into the tools below.</p>
       <p class="hint" style="color:var(--amber);">Since every distributor's PDF layout differs, this uses a general pattern-matching approach, not a per-distributor template. Spot-check the output before using it — if a particular distributor's format parses badly, share a sample and it can be tuned.</p>
@@ -2053,6 +2075,329 @@ async function testPharmarackConnection(){
   } catch(err){
     resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">BLOCKED — the browser refused this request (likely CORS). Error: ${escapeHtml(err.message)}. This confirms Pharmarack's server doesn't allow direct browser requests from this app's domain — we'll need to keep this as a script run outside the app, same as the other scrapers.</p>`;
   }
+}
+
+// ============================================================
+// PHARMARACK MULTI-DISTRIBUTOR SEARCH
+// (ported from the Python matching script — same logic)
+// ============================================================
+const PR_FORM_WORDS = new Set(["tablet","tablets","tab","tabs","cap","caps","capsule","capsules",
+  "syrup","syp","syr","suspension","susp","suspn","drops","drop","dps",
+  "cream","crm","lotion","gel","ointment","oint","solution","soln","sol",
+  "liquid","liq","powder","pwd","sachet","sach","spray","respules",
+  "rotacap","inhaler","kit","tube","oil","gargle","mouthwash","soap",
+  "shampoo","mg","mcg","ml","gm","g","kg","iu","sugar","free","sf"]);
+const PR_INJECTABLE = new Set(["inj","injection","injections","iv","vial","vials","ampoule","ampoules","ampule","ampules","infusion"]);
+const PR_LIQUID_WORDS = new Set(["syrup","syp","syr","suspension","susp","suspn","drops","drop","dps","solution","soln","lotion","liquid","liq"]);
+const PR_CREAMPWD_WORDS = new Set(["cream","crm","gel","ointment","oint","powder","pwd"]);
+const PR_SOLID_WORDS = new Set(["tab","tabs","tablet","tablets","cap","caps","capsule","capsules"]);
+
+function pr_norm(s){
+  s = String(s).toLowerCase();
+  s = s.replace(/[`'’]s\b/g, ' ');
+  s = s.replace(/(\d)\.(\d)/g, '$1\x00$2');
+  s = s.replace(/[^a-z0-9 ]/g, ' ');
+  s = s.split('\x00').join('.');
+  return s.replace(/\s+/g, ' ').trim();
+}
+function pr_numbers(s){
+  const out = new Set();
+  const matches = String(s).match(/\d+(?:\.\d+)?/g) || [];
+  matches.forEach(n => out.add(parseFloat(n)));
+  return out;
+}
+function pr_firstNumber(nameNorm){
+  for(const t of nameNorm.split(' ')){
+    const ns = pr_numbers(t);
+    if(ns.size) return Math.min(...ns);
+  }
+  return null;
+}
+function pr_extractAmounts(text, unitSrc){
+  const t = pr_norm(text);
+  const out = new Set();
+  const re = new RegExp('(\\d+(?:\\.\\d+)?)\\s*(?:' + unitSrc + ')(?![a-z])', 'g');
+  let m;
+  while((m = re.exec(t)) !== null) out.add(parseFloat(m[1]));
+  return out;
+}
+function pr_prep(name){
+  const kn = pr_norm(name);
+  const toks = kn.split(' ').filter(Boolean);
+  const words = toks.filter(t => !PR_FORM_WORDS.has(t) && pr_numbers(t).size === 0);
+  const brand = words.length ? words[0] : (toks.length ? toks[0] : kn);
+  const bp = [];
+  for(const t of toks){
+    if(pr_numbers(t).size > 0) break;
+    if(!PR_FORM_WORDS.has(t)) bp.push(t);
+  }
+  return { brand, strength: pr_firstNumber(kn), variants: new Set(words.slice(1)), wordset: new Set(words), brand_portion: bp.join(' ') };
+}
+function pr_inputForm(pack){
+  const toks = new Set(pr_norm(pack).split(' ').filter(Boolean));
+  if(toks.has('ml')) return 'LIQUID';
+  if(toks.has('gm') || toks.has('gram') || toks.has('grams') || toks.has('g')) return 'CREAMPWD';
+  for(const w of PR_SOLID_WORDS) if(toks.has(w)) return 'SOLID';
+  return 'UNKNOWN';
+}
+function pr_inputAmount(pack, form){
+  if(form === 'LIQUID') return pr_extractAmounts(pack, 'ml');
+  if(form === 'CREAMPWD') return pr_extractAmounts(pack, 'gm|gram');
+  return new Set();
+}
+function pr_inputCount(pack){
+  const nums = pr_norm(pack).match(/\d+/g);
+  return nums ? parseInt(nums[0]) : null;
+}
+function pr_resultForm(item){
+  const packing = pr_norm(item.Packing || '');
+  const ptoks = new Set(packing.split(' ').filter(Boolean));
+  const ntoks = new Set([...pr_norm(item.ProductName||'').split(' '), ...pr_norm(item.ProductFullName||'').split(' ')].filter(Boolean));
+  if(ptoks.has('ml') || ntoks.has('ml')) return 'LIQUID';
+  if(ptoks.has('gm') || ntoks.has('gm') || ntoks.has('gram')) return 'CREAMPWD';
+  for(const w of PR_LIQUID_WORDS) if(ntoks.has(w)) return 'LIQUID';
+  for(const w of PR_CREAMPWD_WORDS) if(ntoks.has(w)) return 'CREAMPWD';
+  for(const w of PR_SOLID_WORDS) if(ntoks.has(w)) return 'SOLID';
+  if(/\d+\s*x\s*\d+/.test(packing) || /\d+\s*s$/.test(packing)) return 'SOLID';
+  return 'UNKNOWN';
+}
+function pr_combined(item){
+  return [item.Packing||'', item.ProductName||'', item.ProductFullName||''].join(' ');
+}
+function pr_packCountOf(packingText){
+  const pk = pr_norm(packingText||'');
+  if(!pk) return null;
+  const m = pk.match(/(\d+)\s*[x*]\s*(\d+)/);
+  if(m) return parseInt(m[1]) * parseInt(m[2]);
+  const nums = pk.match(/\d+/g);
+  return nums ? parseInt(nums[nums.length-1]) : null;
+}
+function pr_packMatches(pk, form, icount){
+  if(form === 'LIQUID' || form === 'CREAMPWD') return true;
+  if(form === 'SOLID' && icount !== null){
+    const pc = pr_packCountOf(pk);
+    return pc !== null ? pc === icount : false;
+  }
+  return true;
+}
+function pr_keep(item, q, qForm, qAmt){
+  const n1 = pr_norm(item.ProductName || '');
+  const n2 = pr_norm(item.ProductFullName || '');
+  const nset = new Set([...n1.split(' '), ...n2.split(' ')].filter(Boolean));
+  for(const w of PR_INJECTABLE) if(nset.has(w)) return false;
+  if(qForm !== 'UNKNOWN'){
+    const rf = pr_resultForm(item);
+    if(rf !== 'UNKNOWN' && rf !== qForm) return false;
+    if(qAmt.size && (qForm === 'LIQUID' || qForm === 'CREAMPWD')){
+      const unit = qForm === 'LIQUID' ? 'ml' : 'gm|gram';
+      const rv = pr_extractAmounts(pr_combined(item), unit);
+      if(rv.size){
+        let overlap = false;
+        for(const v of qAmt) if(rv.has(v)) overlap = true;
+        if(!overlap) return false;
+      }
+    }
+  }
+  for(const cn of [n1, n2]){
+    if(!cn) continue;
+    const c = pr_prep(cn);
+    if(c.brand !== q.brand) continue;
+    if(q.strength !== null){
+      if(c.strength !== q.strength) continue;
+      if(c.brand_portion !== q.brand_portion) continue;
+      if(q.variants.size){
+        let subset = true;
+        for(const v of q.variants) if(!c.wordset.has(v)) subset = false;
+        if(!subset) continue;
+      }
+      return true;
+    } else {
+      if(c.wordset.size === q.wordset.size && [...q.wordset].every(w => c.wordset.has(w))) return true;
+    }
+  }
+  return false;
+}
+
+function downloadSamplePharmarackFormat(){
+  const rows = [
+    { 'Med Name': 'Dolo 650 Tablet', 'Pack Size': '15 Tablet' },
+    { 'Med Name': 'Augmentin 625 Duo Tablet', 'Pack Size': '10 Tablet' },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample');
+  XLSX.writeFile(wb, 'sample_pharmarack_search_list.xlsx');
+}
+
+async function handlePharmarackSearchUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('pharmarackSearchResult');
+  if(!file) return;
+
+  const curlText = document.getElementById('pharmarackSearchCurl').value;
+  const tokenMatch = curlText.match(/[Bb]earer\s+([A-Za-z0-9._-]+)/);
+  const storeMatch = curlText.match(/"StoreId"\s*:\s*\[([0-9,\s]*)\]/);
+  if(!tokenMatch || !storeMatch || !storeMatch[1].trim()){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Paste a valid Pharmarack cURL in the box above first (needs a Bearer token and StoreId list).</p>`;
+    e.target.value = '';
+    return;
+  }
+  const token = tokenMatch[1];
+  const storeIds = storeMatch[1].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+  const reader = new FileReader();
+  reader.onload = async (evt) => {
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+    const cols = Object.keys(rows[0]);
+    const nameCol = cols.find(c => /med.*name|item.*name|^name$|product/i.test(c));
+    const packCol = cols.find(c => /pack/i.test(c));
+    if(!nameCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a medicine name column. Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+
+    const meds = [];
+    const packMap = {};
+    const seen = new Set();
+    rows.forEach(r => {
+      const nm = String(r[nameCol]||'').trim();
+      if(!nm || seen.has(nm)) return;
+      seen.add(nm); meds.push(nm);
+      packMap[nm] = packCol ? String(r[packCol]||'').trim() : '';
+    });
+
+    await runPharmarackSearch(meds, packMap, token, storeIds, resultEl);
+    e.target.value = '';
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
+  const PAGE_SIZE = 100;
+  const DELAY = 1000;
+  const detailRows = [];
+  const zeroHits = [];
+
+  for(let i = 0; i < meds.length; i++){
+    const med = meds[i];
+    resultEl.innerHTML = `<p class="no-history">Searching [${i+1}/${meds.length}]: ${escapeHtml(med)}...</p>`;
+    const q = pr_prep(med);
+    const qForm = pr_inputForm(packMap[med] || '');
+    const qAmt = pr_inputAmount(packMap[med] || '', qForm);
+
+    let got = [];
+    let skip = 0;
+    while(true){
+      let batch = [];
+      try{
+        const resp = await fetch('https://pharmretail-elasticsearch.pharmarack.com/open-search/api/v2/search?uuid=' + crypto.randomUUID(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+          body: JSON.stringify({
+            SearchKeyword: med, StoreId: storeIds, NonMappedStoreId: [],
+            Count: PAGE_SIZE, SkipCount: skip, isMappedSearch: null,
+            IsStock: 1, IsScheme: 2, IsSort: 2, SearchMode: 0, CartSource: 'MOVP',
+          }),
+        });
+        if(resp.status === 401 || resp.status === 403){
+          resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Token expired mid-search. Get a fresh cURL and try again — items already found so far were not saved.</p>`;
+          return;
+        }
+        const data = await resp.json();
+        batch = data.data || [];
+      } catch(err){
+        resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Connection error during search: ${escapeHtml(err.message)}</p>`;
+        return;
+      }
+      got = got.concat(batch);
+      if(batch.length < PAGE_SIZE) break;
+      skip += PAGE_SIZE;
+      await new Promise(r => setTimeout(r, DELAY));
+    }
+
+    const kept = got.filter(it => pr_keep(it, q, qForm, qAmt));
+    const inpack = packMap[med] || '';
+    kept.forEach(it => {
+      detailRows.push({
+        Medicine: it.ProductFullName, Distributor: it.StoreName, Company: it.ManufactureName,
+        MRP: it.MRP, PTR: it.PTR, Pack: it.Packing, Scheme: it.Scheme, Stock: it.Stock,
+        Margin: it.Margin, NetRate: it.NetRate, InputPack: inpack, SearchTerm: med,
+      });
+    });
+    if(!kept.length) zeroHits.push(med);
+    await new Promise(r => setTimeout(r, DELAY));
+  }
+
+  // ---- build Compare sheet: one row per input item ----
+  const distributors = [...new Set(detailRows.map(r => r.Distributor))].sort();
+  function modeOrFirst(vals){
+    const clean = vals.filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+    if(!clean.length) return '';
+    const counts = {};
+    clean.forEach(v => counts[v] = (counts[v]||0) + 1);
+    return Object.entries(counts).sort((a,b) => b[1]-a[1])[0][0];
+  }
+  function medianOf(vals){
+    const nums = vals.map(v => parseFloat(v)).filter(v => !isNaN(v)).sort((a,b) => a-b);
+    if(!nums.length) return '';
+    const mid = Math.floor(nums.length/2);
+    return nums.length % 2 ? nums[mid] : Math.round(((nums[mid-1]+nums[mid])/2)*100)/100;
+  }
+  function cellFor(best){
+    const parts = [];
+    const sch = best.Scheme && String(best.Scheme).trim() ? String(best.Scheme).trim() : '—';
+    parts.push(sch);
+    if(best.Margin !== undefined && best.Margin !== null && best.Margin !== '') parts.push(`Mgn ${best.Margin}%`);
+    if(best.Stock !== undefined && best.Stock !== null && best.Stock !== '') parts.push(`Qty ${best.Stock}`);
+    return parts.join(' | ');
+  }
+
+  const compareRows = meds.map(med => {
+    const inpack = packMap[med] || '';
+    const g = detailRows.filter(r => r.SearchTerm === med);
+    const row = { 'Med Name': med, 'Pack Size': inpack, 'Company': '', 'MRP': '', 'PTR (typical)': '' };
+    if(!g.length){
+      distributors.forEach(d => row[d] = '');
+      return row;
+    }
+    const form = pr_inputForm(inpack);
+    const icount = form === 'SOLID' ? pr_inputCount(inpack) : null;
+    const filtered = g.filter(r => pr_packMatches(r.Pack, form, icount));
+    const base = filtered.length ? filtered : g;
+    row['Company'] = modeOrFirst(base.map(r => r.Company));
+    row['MRP'] = modeOrFirst(base.map(r => r.MRP));
+    row['PTR (typical)'] = medianOf(base.map(r => r.PTR));
+    distributors.forEach(d => {
+      let sub = base.filter(r => r.Distributor === d);
+      if(!sub.length) sub = g.filter(r => r.Distributor === d);
+      if(!sub.length){ row[d] = ''; return; }
+      sub.sort((a,b) => (parseFloat(b.Margin)||-Infinity) - (parseFloat(a.Margin)||-Infinity));
+      row[d] = cellFor(sub[0]);
+    });
+    return row;
+  });
+
+  const wb = XLSX.utils.book_new();
+  const wsCompare = XLSX.utils.json_to_sheet(compareRows);
+  XLSX.utils.book_append_sheet(wb, wsCompare, 'Compare');
+  const wsDetails = XLSX.utils.json_to_sheet(detailRows);
+  XLSX.utils.book_append_sheet(wb, wsDetails, 'Details');
+  XLSX.writeFile(wb, `pharmarack_search_${new Date().toISOString().slice(0,10)}.xlsx`);
+
+  const matchedCount = compareRows.filter(r => distributors.some(d => r[d])).length;
+  resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${meds.length} medicines searched, ${matchedCount} had matches across ${distributors.length} distributors, ${zeroHits.length} had no match. Downloaded as Excel.</p>${zeroHits.length ? `<p class="no-history">No match: ${escapeHtml(zeroHits.join(', '))}</p>` : ''}`;
 }
 
 // ============================================================
