@@ -392,6 +392,9 @@ function attachTabHandlers(){
   if(addWhForm) addWhForm.addEventListener('submit', handleAddWarehouse);
   const addDistForm = document.getElementById('addDistributorForm');
   if(addDistForm) addDistForm.addEventListener('submit', handleAddDistributor);
+
+  const testPharmarackBtn = document.getElementById('testPharmarackBtn');
+  if(testPharmarackBtn) testPharmarackBtn.addEventListener('click', testPharmarackConnection);
 }
 
 function handleFileUpload(e){
@@ -1955,6 +1958,15 @@ function adminTabHTML(){
         ${state.warehouses.map(w=>`<li><span>${escapeHtml(w.name)}</span><span class="mono" style="color:var(--muted); font-size:12px;">${w.id.slice(0,8)}</span></li>`).join('')}
       </ul>
     </div>
+    <div class="card">
+      <h2>Pharmarack connection test (temporary)</h2>
+      <p class="hint">Paste a fresh cURL from Pharmarack (same as you'd use in the Python script) and click Test — this checks whether the app can reach Pharmarack's API directly from the browser. If it works, we can build the real search feature here. If it's blocked, we'll know for certain and stick with the Python script approach.</p>
+      <textarea id="pharmarackCurlInput" placeholder="Paste the full curl '...' command here" style="min-height:120px;"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="testPharmarackBtn">Test connection</button>
+      </div>
+      <div id="pharmarackTestResult"></div>
+    </div>
   `;
 }
 
@@ -1982,6 +1994,65 @@ async function handleAddDistributor(e){
   await sb.from('distributor_warehouses').insert({ distributor_id: data.id, warehouse_id: warehouseId });
   alert('Distributor added.');
   e.target.reset();
+}
+
+// ============================================================
+// PHARMARACK CORS TEST (temporary — checks feasibility only)
+// ============================================================
+async function testPharmarackConnection(){
+  const curlText = document.getElementById('pharmarackCurlInput').value;
+  const resultEl = document.getElementById('pharmarackTestResult');
+
+  const tokenMatch = curlText.match(/[Bb]earer\s+([A-Za-z0-9._-]+)/);
+  const storeMatch = curlText.match(/"StoreId"\s*:\s*\[([0-9,\s]*)\]/);
+
+  if(!tokenMatch){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a Bearer token in that cURL. Make sure you pasted the whole thing.</p>`;
+    return;
+  }
+  if(!storeMatch || !storeMatch[1].trim()){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find a StoreId list in that cURL.</p>`;
+    return;
+  }
+
+  const token = tokenMatch[1];
+  const storeIds = storeMatch[1].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+  resultEl.innerHTML = `<p class="no-history">Testing connection to Pharmarack...</p>`;
+
+  try{
+    const resp = await fetch('https://pharmretail-elasticsearch.pharmarack.com/open-search/api/v2/search?uuid=' + crypto.randomUUID(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token,
+      },
+      body: JSON.stringify({
+        SearchKeyword: 'dolo 650',
+        StoreId: storeIds,
+        NonMappedStoreId: [],
+        Count: 5,
+        SkipCount: 0,
+        isMappedSearch: null,
+        IsStock: 1,
+        IsScheme: 2,
+        IsSort: 2,
+        SearchMode: 0,
+        CartSource: 'MOVP',
+      }),
+    });
+
+    if(!resp.ok){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Request reached Pharmarack but got an error response: HTTP ${resp.status}. ${resp.status === 401 || resp.status === 403 ? 'Token may be expired — try a fresh cURL.' : ''}</p>`;
+      return;
+    }
+    const data = await resp.json();
+    const items = data.data || [];
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">SUCCESS — connection works directly from the browser! Got ${items.length} result(s) for test search "dolo 650". This means the full feature can be built in-app.</p>
+      <pre style="background:#F0EEE7; padding:10px; border-radius:8px; font-size:11px; overflow:auto; max-height:200px;">${escapeHtml(JSON.stringify(items.slice(0,2), null, 2))}</pre>`;
+  } catch(err){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">BLOCKED — the browser refused this request (likely CORS). Error: ${escapeHtml(err.message)}. This confirms Pharmarack's server doesn't allow direct browser requests from this app's domain — we'll need to keep this as a script run outside the app, same as the other scrapers.</p>`;
+  }
 }
 
 // ============================================================
