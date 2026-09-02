@@ -561,6 +561,27 @@ async function logOrderRun(rows){
 function repeatsTabHTML(){
   return `
     <div class="card">
+      <h2>Upload purchase data</h2>
+      <p class="hint">Logs what was <strong>actually received</strong> from distributors (not what was ordered) — keeps distributor suggestions, Repeat Orders, and Pharmarack's "Your History" columns accurate over time.</p>
+      <label>Warehouse</label>
+      <select id="purchaseDataWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload purchase data
+          <input type="file" id="purchaseDataInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="downloadSamplePurchaseDataBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">In Date</span> (when goods were received), <span class="mono">quantity</span>. Optional: <span class="mono">Bill Date</span> (when the invoice was raised — separate from In Date), <span class="mono">MRP</span>, <span class="mono">invoice amount</span>, <span class="mono">margin</span> (calculated automatically from MRP + invoice amount if not given).</p>
+      <div id="purchaseDataResult"></div>
+      <div style="margin-top:16px;">
+        <p class="hint" style="margin-bottom:8px;"><strong>Upload history — check this before uploading, to avoid re-uploading the same dates:</strong></p>
+        <div id="purchaseUploadLogArea"></div>
+      </div>
+    </div>
+    <div class="card">
       <h2>Upload order sheet</h2>
       <p class="hint">For order sheets from your own export (item name, pack size, distributor ordered to, qty, last order date). Groups items by date into order runs — same repeat-order logic as orders placed live in the app.</p>
       <label>Warehouse</label>
@@ -576,7 +597,7 @@ function repeatsTabHTML(){
         </label>
         <button class="btn btn-ghost" id="downloadSampleOrderSheetBtn">Download sample format</button>
       </div>
-      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty</span>. Extra columns (stock, sales history, etc.) are fine — they're just ignored for this upload.</p>
+      <p class="hint" style="margin:10px 0 0;">Expected columns (names flexible, just need to contain these words): <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">qty placed</span>. Optional: <span class="mono">PO Number</span>, and for items <em>not</em> ordered, a <span class="mono">Reason</span> (Short in Market / Sufficient Stock / On Arrangement Only). Extra columns (stock, sales history, etc.) are fine — they're just ignored. The app automatically flags any item repeating from the last 7 days — no manual VLOOKUP needed.</p>
       <div id="orderSheetResult"></div>
     </div>
     <div class="card">
@@ -584,10 +605,23 @@ function repeatsTabHTML(){
       <p class="hint">Items ordered on 2+ different days recently for the selected warehouse. Cross-checked against purchase history to guess why it's repeating.</p>
     </div>
     <div id="repeatsArea"></div>
+    <div class="card">
+      <h2>Consider increasing order quantity</h2>
+      <p class="hint">Items ordered 3+ times in the last 30 days, where a purchase genuinely landed between each repeat — this isn't a delivery problem, the base order quantity itself looks too small for real demand.</p>
+    </div>
+    <div id="qtySuggestionsArea"></div>
   `;
 }
 
 function initRepeatsTab(){
+  const pdInput = document.getElementById('purchaseDataInput');
+  if(pdInput) pdInput.addEventListener('change', handlePurchaseDataUpload);
+  const pdSampleBtn = document.getElementById('downloadSamplePurchaseDataBtn');
+  if(pdSampleBtn) pdSampleBtn.addEventListener('click', downloadSamplePurchaseDataFormat);
+  const pdWarehouseSelect = document.getElementById('purchaseDataWarehouseSelect');
+  if(pdWarehouseSelect) pdWarehouseSelect.addEventListener('change', loadPurchaseUploadLog);
+  loadPurchaseUploadLog();
+
   const input = document.getElementById('orderSheetInput');
   if(input) input.addEventListener('change', handleOrderSheetUpload);
   const sampleBtn = document.getElementById('downloadSampleOrderSheetBtn');
@@ -599,31 +633,19 @@ function initRepeatsTab(){
     dtInput.value = now.toISOString().slice(0,16);
   }
   loadRepeats();
+  loadQtyIncreaseSuggestions();
 }
 
 function downloadSampleOrderSheetFormat(){
   const rows = [
-    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Current Stock(loose)': 4, 'Current Stock(strip)': 1,
-      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited', 'Qty': 2,
-      'Last Order Date': '2026-08-01', 'Order to place': 3,
-      'Last 7 days Sale': 4, 'Last 15 days Sale': 11, 'Last 30 days Sale': 14, 'Last 45 days Sale': 30,
-      'Last 60 days Sale': 43, 'Last 90 Days': 70, 'Last 120 Days': 89, 'Last 180': 112,
-      'Unique Cust (7days)': 4, 'Unique Cust(15 days)': 19, 'Unique Cust(45 days)': 26, 'Unique Cust(60 days)': 39,
-      'unique Cust(90 days)': 39, 'No of Bills(30 d)': 16, 'No of Bills(60 d)': 35, 'No of Bills(120 d)': 71 },
-    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Current Stock(loose)': 0, 'Current Stock(strip)': 0,
-      'Type of Medicine': 'Fast', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited', 'Qty': 5,
-      'Last Order Date': '2026-08-02', 'Order to place': 5,
-      'Last 7 days Sale': 8, 'Last 15 days Sale': 20, 'Last 30 days Sale': 40, 'Last 45 days Sale': 55,
-      'Last 60 days Sale': 70, 'Last 90 Days': 100, 'Last 120 Days': 130, 'Last 180': 180,
-      'Unique Cust (7days)': 7, 'Unique Cust(15 days)': 15, 'Unique Cust(45 days)': 30, 'Unique Cust(60 days)': 40,
-      'unique Cust(90 days)': 50, 'No of Bills(30 d)': 25, 'No of Bills(60 d)': 45, 'No of Bills(120 d)': 90 },
-    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Current Stock(loose)': 2, 'Current Stock(strip)': 0,
-      'Type of Medicine': 'Average', 'Distributor Name order place to': 'Neelkanth Pharma Logistics Private Limited', 'Qty': 3,
-      'Last Order Date': '2026-08-03', 'Order to place': 3,
-      'Last 7 days Sale': 1, 'Last 15 days Sale': 3, 'Last 30 days Sale': 5, 'Last 45 days Sale': 8,
-      'Last 60 days Sale': 10, 'Last 90 Days': 15, 'Last 120 Days': 20, 'Last 180': 28,
-      'Unique Cust (7days)': 1, 'Unique Cust(15 days)': 3, 'Unique Cust(45 days)': 6, 'Unique Cust(60 days)': 8,
-      'unique Cust(90 days)': 10, 'No of Bills(30 d)': 4, 'No of Bills(60 d)': 8, 'No of Bills(120 d)': 15 },
+    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited',
+      'PO Number': 'PO10234', 'Qty Placed': 20, 'Reason': '' },
+    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited',
+      'PO Number': 'PO10235', 'Qty Placed': 10, 'Reason': '' },
+    { 'Item Name': 'Alex Cough Sugar Free Lozenges', 'Pack Size': '10 Lozenges', 'Distributor Name order place to': '',
+      'PO Number': '', 'Qty Placed': '', 'Reason': 'Short in Market' },
+    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Distributor Name order place to': '',
+      'PO Number': '', 'Qty Placed': '', 'Reason': 'Sufficient Stock' },
   ];
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
@@ -664,10 +686,13 @@ async function handleOrderSheetUpload(e){
     const itemCol = find('item', 'name') || find('item');
     const packCol = find('pack');
     const distCol = find('distributor');
-    const qtyCol = cols.find(c => {
-      const lc = c.toLowerCase().trim();
-      return (lc === 'qty' || lc.includes('qty')) && !lc.includes('place');
-    });
+    const qtyCol = cols.find(c => /qty.*placed|placed.*qty/i.test(c))
+      || cols.find(c => {
+        const lc = c.toLowerCase().trim();
+        return (lc === 'qty' || lc.includes('qty')) && !lc.includes('to place') && !lc.includes('place)');
+      });
+    const poCol = cols.find(c => /po\s*number|po\s*no\b/i.test(c));
+    const reasonCol = cols.find(c => /reason/i.test(c));
     // Feature 2 columns — all optional, only used if present
     const stockLooseCol = find('stock', 'loose');
     const stockStripCol = find('strip');
@@ -740,7 +765,14 @@ async function handleOrderSheetUpload(e){
       const distId = distCol ? resolveDistributor(r[distCol]) : null;
       if(distCol && r[distCol] && !distId) distUnmatched++;
       const qty = parseInt(r[qtyCol]) || 0;
-      runItemsToInsert.push({ item_id: itemId, qty, distributor_id: distId });
+      const reason = reasonCol ? String(r[reasonCol]||'').trim() : '';
+      const poNumber = poCol ? String(r[poCol]||'').trim() : '';
+      const isOrdered = qty > 0 && distId;
+      const status = isOrdered ? 'ordered' : (reason ? 'not_ordered' : 'ordered');
+      runItemsToInsert.push({
+        item_id: itemId, qty: isOrdered ? qty : 0, distributor_id: isOrdered ? distId : null,
+        po_number: poNumber || null, reason: reason || null, status,
+      });
 
       if(hasInventoryData){
         const numOrNull = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
@@ -778,6 +810,25 @@ async function handleOrderSheetUpload(e){
       return;
     }
 
+    // ---- auto repeat-detection: has this item shown up in an order run
+    // for this warehouse in the last 7 days? replaces manual VLOOKUP ----
+    resultEl.innerHTML = `<p class="no-history">Checking for repeats against the last 7 days...</p>`;
+    const allItemIds = [...new Set(runItemsToInsert.map(r => r.item_id))];
+    const sevenDaysAgo = new Date(new Date(dateTimeVal).getTime() - 7*24*60*60*1000).toISOString();
+    const { data: priorRuns } = await sb.from('order_run_items')
+      .select('item_id, order_runs!inner(run_at, warehouse_id)')
+      .in('item_id', allItemIds)
+      .eq('order_runs.warehouse_id', warehouseId)
+      .gte('order_runs.run_at', sevenDaysAgo)
+      .lt('order_runs.run_at', runAtIso);
+    const priorDatesByItem = {};
+    (priorRuns||[]).forEach(p => {
+      if(!priorDatesByItem[p.item_id]) priorDatesByItem[p.item_id] = [];
+      priorDatesByItem[p.item_id].push(p.order_runs.run_at);
+    });
+    const itemNameById = {};
+    itemsData.forEach(i => { itemNameById[i.id] = i.item_name; });
+
     const { data: run, error: runErr } = await sb.from('order_runs')
       .insert({ warehouse_id: warehouseId, run_at: runAtIso })
       .select().single();
@@ -802,9 +853,212 @@ async function handleOrderSheetUpload(e){
       }
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows for Feature 2 analysis.${invErrMsg ? ` (Some snapshot rows failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>`;
+    const repeatCount = Object.keys(priorDatesByItem).length;
+    const repeatListHtml = repeatCount ? `
+      <table class="summary" style="margin-top:10px;">
+        <tr><th>Repeating item</th><th>Also ordered on</th></tr>
+        ${Object.entries(priorDatesByItem).map(([itemId, dates])=>`
+          <tr>
+            <td>${escapeHtml(itemNameById[itemId]||'?')}</td>
+            <td>${dates.map(d=>new Date(d).toLocaleDateString()).join(', ')}</td>
+          </tr>
+        `).join('')}
+      </table>
+    ` : '';
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows for Feature 2 analysis.${invErrMsg ? ` (Some snapshot rows failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>
+    ${repeatCount ? `<p class="no-history" style="font-weight:600; color:var(--amber);">${repeatCount} item(s) are repeating from the last 7 days — no VLOOKUP needed, see below:</p>${repeatListHtml}` : `<p class="no-history" style="color:var(--green);">No repeats from the last 7 days.</p>`}`;
     e.target.value = '';
     loadRepeats();
+  };
+  if(file.name.endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+// ============================================================
+// PURCHASE DATA UPLOAD + UPLOAD LOG
+// ============================================================
+function downloadSamplePurchaseDataFormat(){
+  const rows = [
+    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Distributor': 'Acorns Health Solutions Private Limited',
+      'Bill Date': '2026-08-14', 'In Date': '2026-08-15', 'Quantity': 20, 'MRP': 4500, 'Invoice Amount': 3200, 'Margin': 28.9 },
+    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Distributor': 'Jeplus Healthcare Private Limited',
+      'Bill Date': '2026-08-15', 'In Date': '2026-08-15', 'Quantity': 10, 'MRP': 1200, 'Invoice Amount': 950, 'Margin': '' },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sample Purchase Data');
+  XLSX.writeFile(wb, 'sample_purchase_data_format.xlsx');
+}
+
+async function loadPurchaseUploadLog(){
+  const el = document.getElementById('purchaseUploadLogArea');
+  if(!el) return;
+  const warehouseId = document.getElementById('purchaseDataWarehouseSelect').value;
+  el.innerHTML = `<p class="no-history">Loading...</p>`;
+  const { data } = await sb.from('purchase_uploads_log')
+    .select('*').eq('warehouse_id', warehouseId).order('date_from', { ascending: false });
+  if(!data || !data.length){
+    el.innerHTML = `<p class="no-history">No purchase data uploaded yet for this warehouse.</p>`;
+    return;
+  }
+  el.innerHTML = `
+    <table class="summary">
+      <tr><th>Date range covered</th><th>Rows</th><th>Uploaded</th></tr>
+      ${data.map(r=>`
+        <tr>
+          <td>${r.date_from} to ${r.date_to}</td>
+          <td>${r.row_count}</td>
+          <td>${new Date(r.uploaded_at).toLocaleString()}</td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
+}
+
+async function handlePurchaseDataUpload(e){
+  const file = e.target.files[0];
+  const warehouseId = document.getElementById('purchaseDataWarehouseSelect').value;
+  const resultEl = document.getElementById('purchaseDataResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt) => {
+    let rows;
+    if(file.name.endsWith('.csv')){
+      const wb = XLSX.read(evt.target.result, {type:'string'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } else {
+      const wb = XLSX.read(evt.target.result, {type:'array'});
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">File appears empty.</p>`;
+      return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...kw) => cols.find(c => kw.every(k => c.toLowerCase().includes(k)));
+    const itemCol = find('item','name') || find('medicine','name') || find('item');
+    const packCol = find('pack');
+    const distCol = find('distributor');
+    const inDateCol = cols.find(c => /\bin\b.*\bdate\b|\bdate\b.*\bin\b/i.test(c)) || find('purchase','date') || find('date');
+    const billDateCol = find('bill','date');
+    const qtyCol = cols.find(c => /qty|quantity/i.test(c));
+    const mrpCol = find('mrp');
+    const invCol = find('invoice');
+    const marginCol = find('margin');
+
+    if(!itemCol || !distCol || !inDateCol || !qtyCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns (item name, distributor, In Date, quantity). Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+
+    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const { data: distData } = await sb.from('distributors').select('id, name');
+    const { data: aliasData } = await sb.from('distributor_aliases').select('alias, distributor_id');
+    const nameToItems = {};
+    itemsData.forEach(i => {
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    const distByName = Object.fromEntries((distData||[]).map(d => [d.name.trim().toLowerCase(), d.id]));
+    const distByAlias = Object.fromEntries((aliasData||[]).map(a => [a.alias.trim().toLowerCase(), a.distributor_id]));
+
+    function resolveItem(name, pack){
+      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
+      if(candidates.length === 1) return candidates[0].id;
+      if(candidates.length > 1 && pack){
+        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        return m ? m.id : null;
+      }
+      return null;
+    }
+    function resolveDistributor(name){
+      const key = String(name).trim().toLowerCase();
+      return distByName[key] || distByAlias[key] || null;
+    }
+    function parseDate(v){
+      if(v instanceof Date) return v.toISOString().slice(0,10);
+      const d = new Date(v);
+      return isNaN(d) ? null : d.toISOString().slice(0,10);
+    }
+
+    let itemUnmatched = 0, distUnmatched = 0, dateInvalid = 0;
+    const toInsert = [];
+    const dates = [];
+    rows.forEach(r => {
+      const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
+      if(!itemId){ itemUnmatched++; return; }
+      const distId = resolveDistributor(r[distCol]);
+      if(!distId){ distUnmatched++; return; }
+      const dateStr = parseDate(r[inDateCol]);
+      if(!dateStr){ dateInvalid++; return; }
+      dates.push(dateStr);
+      const billDateStr = billDateCol ? parseDate(r[billDateCol]) : null;
+
+      const mrp = mrpCol ? parseFloat(r[mrpCol]) : null;
+      const invAmt = invCol ? parseFloat(r[invCol]) : null;
+      let margin = marginCol && r[marginCol] !== undefined && r[marginCol] !== '' ? parseFloat(r[marginCol]) : null;
+      if((margin === null || isNaN(margin)) && mrp && invAmt) margin = Math.round(((mrp - invAmt) / mrp) * 10000) / 100;
+
+      toInsert.push({
+        warehouse_id: warehouseId, item_id: itemId, distributor_id: distId,
+        purchase_date: dateStr, bill_date: billDateStr, raw_medicine_name: String(r[itemCol]),
+        pack_size: packCol ? String(r[packCol]||'') : null,
+        total_quantity: parseInt(r[qtyCol]) || 0,
+        total_mrp: isNaN(mrp) ? null : mrp,
+        total_invoice_amount: isNaN(invAmt) ? null : invAmt,
+        total_margin_percentage: (margin === null || isNaN(margin)) ? null : margin,
+      });
+    });
+
+    if(!toInsert.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be processed. ${itemUnmatched} item mismatches, ${distUnmatched} distributor mismatches, ${dateInvalid} invalid dates.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const dateFrom = dates.sort()[0];
+    const dateTo = dates.sort()[dates.length-1];
+
+    // check for overlap with existing purchase_history
+    const { count: overlapCount } = await sb.from('purchase_history')
+      .select('id', { count: 'exact', head: true })
+      .eq('warehouse_id', warehouseId)
+      .gte('purchase_date', dateFrom)
+      .lte('purchase_date', dateTo);
+
+    if(overlapCount && overlapCount > 0){
+      const proceed = confirm(
+        `${overlapCount} purchase records already exist for this warehouse between ${dateFrom} and ${dateTo}. ` +
+        `Uploading will add these ${toInsert.length} rows on top of that (possible duplicates).\n\nContinue anyway?`
+      );
+      if(!proceed){
+        resultEl.innerHTML = `<p class="no-history">Upload cancelled — no changes made.</p>`;
+        e.target.value = '';
+        return;
+      }
+    }
+
+    let inserted = 0, lastError = null;
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      const { error } = await sb.from('purchase_history').insert(chunk);
+      if(!error) inserted += chunk.length; else lastError = error;
+    }
+
+    if(inserted > 0){
+      await sb.from('purchase_uploads_log').insert({
+        warehouse_id: warehouseId, date_from: dateFrom, date_to: dateTo, row_count: inserted,
+      });
+    }
+
+    resultEl.innerHTML = `<p class="no-history" style="color:${inserted===0 ? 'var(--red)' : 'var(--green)'};">${inserted > 0 ? `Done — logged ${inserted} purchase records (${dateFrom} to ${dateTo}).` : 'Nothing was saved.'}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched).` : ''}${distUnmatched ? ` ${distUnmatched} rows skipped (distributor not recognized).` : ''}${dateInvalid ? ` ${dateInvalid} rows skipped (invalid date).` : ''}${lastError ? ` Some rows failed: ${escapeHtml(lastError.message)}` : ''}</p>`;
+    e.target.value = '';
+    loadPurchaseUploadLog();
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
   else reader.readAsArrayBuffer(file);
@@ -832,6 +1086,28 @@ async function loadRepeats(){
     `;
   }).join('');
 }
+
+async function loadQtyIncreaseSuggestions(){
+  const el = document.getElementById('qtySuggestionsArea');
+  if(!el) return;
+  el.innerHTML = `<div class="card empty-state">Loading...</div>`;
+  const { data, error } = await sb.rpc('get_qty_increase_suggestions', { p_warehouse_id: state.currentWarehouse, p_days_back: 30 });
+  if(error || !data || !data.length){
+    el.innerHTML = `<div class="card empty-state">No items currently fit this pattern for this warehouse in the last 30 days.</div>`;
+    return;
+  }
+  el.innerHTML = data.map(r=>`
+    <div class="item-row">
+      <div class="item-head">
+        <div><span class="item-name">${escapeHtml(r.item_name)}</span> <span class="item-meta">${escapeHtml(r.pack_size||'')} · ${escapeHtml(r.code)}</span></div>
+        <span class="qty-badge">Ordered ${r.order_count} times</span>
+      </div>
+      <p class="no-history" style="color:var(--teal-dark); font-style:normal; font-weight:600;">Purchased ${r.purchased_gaps} of ${r.total_gaps} times between repeats — consistently selling through supply. Consider a larger base order quantity.</p>
+      <p class="no-history">Order dates: ${r.run_dates.join(', ')}</p>
+    </div>
+  `).join('');
+}
+
 let matchState = {
   distributors: [],
   currentDistributor: null,
@@ -1062,6 +1338,27 @@ async function handleAnalysisUpload(e){
 function refillTabHTML(){
   return `
     <div class="card">
+      <h2>Stockout investigation</h2>
+      <p class="hint">Pick an item and warehouse to see its full timeline: when it was ordered, whether a purchase was ever recorded, and its stock level over time — laid out chronologically so you can see exactly where the breakdown happened, instead of guessing.</p>
+      <div class="grid-2">
+        <div>
+          <label>Warehouse</label>
+          <select id="investigateWarehouseSelect">
+            ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label>Item name</label>
+          <input type="text" id="investigateItemInput" placeholder="Start typing an item name...">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="runInvestigationBtn">Investigate</button>
+      </div>
+      <div id="investigationResult"></div>
+    </div>
+
+    <div class="card">
       <h2>Upload current inventory</h2>
       <p class="hint">Simple stock snapshot: item name, pack size, current stock. Used to compare against your Min Stock threshold.</p>
       <label>Warehouse</label>
@@ -1116,11 +1413,106 @@ function refillTabHTML(){
 }
 
 function initRefillTab(){
+  const investigateBtn = document.getElementById('runInvestigationBtn');
+  if(investigateBtn) investigateBtn.addEventListener('click', runStockoutInvestigation);
+
   const input = document.getElementById('refillInventoryInput');
   if(input) input.addEventListener('change', handleRefillInventoryUpload);
   const btn = document.getElementById('applyRefillFiltersBtn');
   if(btn) btn.addEventListener('click', loadRefillNeeded);
   loadRefillNeeded();
+}
+
+async function runStockoutInvestigation(){
+  const warehouseId = document.getElementById('investigateWarehouseSelect').value;
+  const itemName = document.getElementById('investigateItemInput').value.trim();
+  const resultEl = document.getElementById('investigationResult');
+  if(!itemName){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Type an item name first.</p>`;
+    return;
+  }
+  resultEl.innerHTML = `<p class="no-history">Searching...</p>`;
+
+  const { data: matches } = await sb.from('items').select('id, item_name, pack_size').ilike('item_name', `%${itemName}%`).limit(10);
+  if(!matches || !matches.length){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No item found matching "${escapeHtml(itemName)}".</p>`;
+    return;
+  }
+  // if multiple matches, use the closest exact match; otherwise show the list to pick from
+  let item = matches.find(m => m.item_name.toLowerCase() === itemName.toLowerCase());
+  if(!item && matches.length > 1){
+    resultEl.innerHTML = `<p class="no-history">Multiple items match — be more specific, or pick one:</p>
+      <ul class="admin-list">${matches.map(m=>`<li><span>${escapeHtml(m.item_name)} (${escapeHtml(m.pack_size||'')})</span></li>`).join('')}</ul>`;
+    return;
+  }
+  item = item || matches[0];
+
+  const [ordersRes, purchasesRes, snapshotsRes] = await Promise.all([
+    sb.from('order_run_items').select('qty, distributor_id, order_runs!inner(run_at, warehouse_id)').eq('item_id', item.id).eq('order_runs.warehouse_id', warehouseId),
+    sb.from('purchase_history').select('purchase_date, distributor_id, total_quantity, total_margin_percentage').eq('item_id', item.id).eq('warehouse_id', warehouseId).order('purchase_date'),
+    sb.from('inventory_snapshots').select('snapshot_at, stock_loose, closing_strip').eq('item_id', item.id).eq('warehouse_id', warehouseId).order('snapshot_at'),
+  ]);
+
+  const distIds = new Set();
+  (ordersRes.data||[]).forEach(o => o.distributor_id && distIds.add(o.distributor_id));
+  (purchasesRes.data||[]).forEach(p => p.distributor_id && distIds.add(p.distributor_id));
+  let distNames = {};
+  if(distIds.size){
+    const { data: dists } = await sb.from('distributors').select('id, name').in('id', [...distIds]);
+    distNames = Object.fromEntries((dists||[]).map(d => [d.id, d.name]));
+  }
+
+  const events = [];
+  (ordersRes.data||[]).forEach(o => events.push({
+    date: o.order_runs.run_at, type: 'order',
+    label: `Ordered — ${o.qty} units${o.distributor_id ? ` to ${distNames[o.distributor_id]||'?'}` : ' (no distributor assigned)'}`,
+  }));
+  (purchasesRes.data||[]).forEach(p => events.push({
+    date: p.purchase_date, type: 'purchase',
+    label: `Purchase recorded — ${p.total_quantity} units${p.distributor_id ? ` from ${distNames[p.distributor_id]||'?'}` : ''}${p.total_margin_percentage ? ` (margin ${p.total_margin_percentage}%)` : ''}`,
+  }));
+  (snapshotsRes.data||[]).forEach(s => {
+    const stock = (s.stock_loose||0) + (s.closing_strip||0);
+    events.push({ date: s.snapshot_at, type: 'stock', label: `Stock snapshot — ${stock} units${stock===0 ? ' (ZERO)' : ''}` });
+  });
+
+  events.sort((a,b) => new Date(a.date) - new Date(b.date));
+
+  if(!events.length){
+    resultEl.innerHTML = `<p class="no-history">No order, purchase, or stock data found for "${escapeHtml(item.item_name)}" at this warehouse. Upload order sheets, purchase data, and inventory snapshots to build this history.</p>`;
+    return;
+  }
+
+  // simple verdict logic
+  const lastOrder = [...(ordersRes.data||[])].sort((a,b)=> new Date(b.order_runs.run_at) - new Date(a.order_runs.run_at))[0];
+  const lastPurchase = [...(purchasesRes.data||[])].sort((a,b)=> new Date(b.purchase_date) - new Date(a.purchase_date))[0];
+  let verdict = '';
+  if(!lastOrder){
+    verdict = `No order for this item was ever logged in the app at this warehouse — either it was never placed, or it was placed through a channel not uploaded here (check with the team directly).`;
+  } else if(!lastPurchase || new Date(lastPurchase.purchase_date) < new Date(lastOrder.order_runs.run_at)){
+    verdict = `Ordered on ${new Date(lastOrder.order_runs.run_at).toLocaleDateString()}${lastOrder.distributor_id ? ` to ${distNames[lastOrder.distributor_id]||'?'}` : ''}, but no purchase has been recorded since — likely not delivered yet, or the distributor didn't fulfill it. Worth a follow-up call.`;
+  } else {
+    verdict = `Ordered on ${new Date(lastOrder.order_runs.run_at).toLocaleDateString()}, and a purchase was recorded on ${new Date(lastPurchase.purchase_date).toLocaleDateString()} — it did arrive. If stock still shows zero after that date, check whether it was entered into the system late (delayed data entry) rather than not delivered at all.`;
+  }
+
+  resultEl.innerHTML = `
+    <div class="item-row">
+      <div class="item-head">
+        <span class="item-name">${escapeHtml(item.item_name)}</span>
+        <span class="item-meta">${escapeHtml(item.pack_size||'')}</span>
+      </div>
+      <p class="no-history" style="font-style:normal; font-weight:600; color:var(--teal-dark);">${verdict}</p>
+    </div>
+    <table class="summary">
+      <tr><th>Date</th><th>Event</th></tr>
+      ${events.map(e=>`
+        <tr>
+          <td class="mono" style="white-space:nowrap;">${new Date(e.date).toLocaleString()}</td>
+          <td style="color:${e.type==='order'?'var(--amber)':e.type==='purchase'?'var(--green)':'var(--muted)'};">${escapeHtml(e.label)}</td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
 }
 
 async function handleRefillInventoryUpload(e){
@@ -1254,7 +1646,7 @@ function matchTabHTML(){
   return `
     <div class="card">
       <h2>Search Pharmarack (multi-distributor)</h2>
-      <p class="hint">Upload an item list (Item Name, Pack Size) — checks Pharmarack's listing across many distributors at once, matching by brand + strength + form. Output is a downloadable Excel only — nothing is saved to your live data automatically.</p>
+      <p class="hint">Upload an item list (Item Name, Pack Size) — checks Pharmarack's listing across many distributors at once, matching by brand + strength + form. Also pulls in your own purchase history for the same items across <strong>all warehouses side by side</strong>, so you can spot when one warehouse is getting a better deal than another on the same medicine. Output is a downloadable Excel only — nothing is saved to your live data automatically.</p>
       <label>Pharmarack cURL (paste fresh each session — copy from your browser's Network tab while searching on Pharmarack)</label>
       <textarea id="pharmarackSearchCurl" placeholder="curl 'https://...' -H '...' --data-raw '...'" style="min-height:100px;"></textarea>
       <div class="btn-row" style="margin-top:10px;">
@@ -2278,14 +2670,53 @@ async function handlePharmarackSearchUpload(e){
       packMap[nm] = packCol ? String(r[packCol]||'').trim() : '';
     });
 
-    await runPharmarackSearch(meds, packMap, token, storeIds, resultEl);
+    // resolve each med to our own item master (for purchase-history comparison)
+    resultEl.innerHTML = `<p class="no-history">Matching items against your master list...</p>`;
+    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const nameToItems = {};
+    itemsData.forEach(i => {
+      const key = i.item_name.trim().toLowerCase();
+      if(!nameToItems[key]) nameToItems[key] = [];
+      nameToItems[key].push(i);
+    });
+    const medToItemId = {};
+    meds.forEach(med => {
+      const candidates = nameToItems[med.trim().toLowerCase()] || [];
+      if(candidates.length === 1){ medToItemId[med] = candidates[0].id; return; }
+      if(candidates.length > 1){
+        const pack = packMap[med];
+        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
+        if(m){ medToItemId[med] = m.id; return; }
+      }
+    });
+
+    // fetch historical distributor suggestions (recency + margin) for matched items,
+    // across ALL warehouses so they can be compared side by side
+    const matchedItemIds = [...new Set(Object.values(medToItemId))];
+    let historyByWarehouse = {}; // warehouse_id -> { item_id: [suggestions] }
+    if(matchedItemIds.length){
+      resultEl.innerHTML = `<p class="no-history">Checking purchase history across all warehouses...</p>`;
+      for(const wh of state.warehouses){
+        const { data: suggData } = await sb.rpc('get_distributor_suggestions', {
+          p_warehouse_id: wh.id, p_item_ids: matchedItemIds,
+        });
+        const byItem = {};
+        (suggData || []).forEach(s => {
+          if(!byItem[s.item_id]) byItem[s.item_id] = [];
+          byItem[s.item_id].push(s);
+        });
+        historyByWarehouse[wh.id] = byItem;
+      }
+    }
+
+    await runPharmarackSearch(meds, packMap, token, storeIds, resultEl, medToItemId, historyByWarehouse);
     e.target.value = '';
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
   else reader.readAsArrayBuffer(file);
 }
 
-async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
+async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl, medToItemId, historyByWarehouse){
   const PAGE_SIZE = 100;
   const DELAY = 1000;
   const detailRows = [];
@@ -2371,9 +2802,16 @@ async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
     const g = detailRows.filter(r => r.SearchTerm === med);
     const base_row = { 'Med Name': med, 'Pack Size': inpack, 'Company': '', 'MRP': '', 'PTR (typical)': '' };
     const distCells = {};
+    const itemId = medToItemId[med];
+    // for each warehouse, take its #1 (best margin) suggestion for this item, if any
+    const historyPerWarehouse = state.warehouses.map(wh => {
+      if(!itemId) return null;
+      const suggs = (historyByWarehouse[wh.id] && historyByWarehouse[wh.id][itemId]) || [];
+      return suggs.length ? suggs[0] : null; // already ranked best-margin-first by the RPC
+    });
     if(!g.length){
       distributors.forEach(d => distCells[d] = null);
-      return { ...base_row, distCells };
+      return { ...base_row, distCells, historyPerWarehouse };
     }
     const form = pr_inputForm(inpack);
     const icount = form === 'SOLID' ? pr_inputCount(inpack) : null;
@@ -2391,28 +2829,42 @@ async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
       const marginVal = parseFloat(top.Margin);
       distCells[d] = { text: cellTextFor(top), margin: isNaN(marginVal) ? null : marginVal };
     });
-    return { ...base_row, distCells };
+    return { ...base_row, distCells, historyPerWarehouse };
   });
 
   // ---- build workbook with ExcelJS (supports real cell colors + wrap text) ----
   const workbook = new ExcelJS.Workbook();
   const compareSheet = workbook.addWorksheet('Compare');
-  const headerRow = ['Med Name', 'Pack Size', 'Company', 'MRP', 'PTR (typical)', ...distributors];
+  const historyHeaders = state.warehouses.map(wh => `Your History: ${wh.name}`);
+  const headerRow = ['Med Name', 'Pack Size', 'Company', 'MRP', 'PTR (typical)', ...historyHeaders, ...distributors];
   compareSheet.addRow(headerRow);
   compareSheet.getRow(1).font = { bold: true };
+  const historyStartCol = 6; // 1-indexed: after Med Name(1) Pack(2) Company(3) MRP(4) PTR(5)
+  const distStartCol = historyStartCol + historyHeaders.length;
   compareSheet.columns = headerRow.map((h, idx) => ({ width: idx < 5 ? 20 : 22 }));
 
-  const GREEN = 'FFC6EFCE', ORANGE = 'FFFFD9A0', YELLOW = 'FFFFF2A8';
+  const GREEN = 'FFC6EFCE', ORANGE = 'FFFFD9A0', YELLOW = 'FFFFF2A8', HISTORY_BLUE = 'FFDCE6F5';
 
   compareCells.forEach(row => {
+    const historyTexts = row.historyPerWarehouse.map(h => {
+      if(!h) return '';
+      const parts = [h.distributor_name];
+      if(h.avg_margin_pct !== null && h.avg_margin_pct !== undefined) parts.push(`Mgn ${h.avg_margin_pct}%`);
+      if(h.last_purchased) parts.push(`Last: ${h.last_purchased}`);
+      return parts.join('\n');
+    });
     const rowValues = [row['Med Name'], row['Pack Size'], row['Company'], row['MRP'], row['PTR (typical)'],
+      ...historyTexts,
       ...distributors.map(d => row.distCells[d] ? row.distCells[d].text : '')];
     const excelRow = compareSheet.addRow(rowValues);
     excelRow.eachCell((cell, colNumber) => {
-      if(colNumber > 5) cell.alignment = { wrapText: true, vertical: 'top' };
+      if(colNumber >= historyStartCol) cell.alignment = { wrapText: true, vertical: 'top' };
+      if(colNumber >= historyStartCol && colNumber < distStartCol){
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HISTORY_BLUE } };
+      }
     });
 
-    // rank this row's distributors by margin, color top 3
+    // rank this row's PHARMARACK distributors by margin, color top 3 (history columns stay blue, not re-ranked)
     const ranked = distributors
       .map((d, i) => ({ d, i, margin: row.distCells[d] ? row.distCells[d].margin : null }))
       .filter(x => x.margin !== null)
@@ -2420,7 +2872,7 @@ async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
 
     const colors = [GREEN, ORANGE, YELLOW];
     ranked.slice(0, 3).forEach((entry, rank) => {
-      const colIndex = 5 + entry.i + 1; // +1 because ExcelJS columns are 1-indexed
+      const colIndex = distStartCol + entry.i; // 0-indexed distributors + start col (already 1-indexed base)
       const cell = excelRow.getCell(colIndex);
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors[rank] } };
     });
@@ -2442,7 +2894,8 @@ async function runPharmarackSearch(meds, packMap, token, storeIds, resultEl){
   URL.revokeObjectURL(url);
 
   const matchedCount = compareCells.filter(r => distributors.some(d => r.distCells[d])).length;
-  resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${meds.length} medicines searched, ${matchedCount} had matches across ${distributors.length} distributors, ${zeroHits.length} had no match. Best margin per item highlighted green (1st), orange (2nd), yellow (3rd). Downloaded as Excel.</p>${zeroHits.length ? `<p class="no-history">No match: ${escapeHtml(zeroHits.join(', '))}</p>` : ''}`;
+  const historyMatchedCount = compareCells.filter(r => r.history && r.history.length).length;
+  resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Done — ${meds.length} medicines searched, ${matchedCount} had Pharmarack matches across ${distributors.length} distributors, ${historyMatchedCount} had your own purchase history (blue columns). Best Pharmarack margin per item highlighted green (1st), orange (2nd), yellow (3rd). Downloaded as Excel.</p>${zeroHits.length ? `<p class="no-history">No Pharmarack match: ${escapeHtml(zeroHits.join(', '))}</p>` : ''}`;
 }
 
 // ============================================================
