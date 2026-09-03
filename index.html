@@ -588,7 +588,7 @@ function repeatsTabHTML(){
       <select id="orderSheetWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
         ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
       </select>
-      <label>Order date &amp; time (when this order was placed)</label>
+      <label>Order date &amp; time (fallback only — used only if your file has no PO Date/Order Sheet Make Date columns)</label>
       <input type="datetime-local" id="orderSheetDateTime" style="max-width:280px; margin-bottom:12px;">
       <div class="btn-row" style="margin-top:0;">
         <label class="btn btn-primary" style="position:relative;">
@@ -638,14 +638,22 @@ function initRepeatsTab(){
 
 function downloadSampleOrderSheetFormat(){
   const rows = [
-    { 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet', 'Distributor Name order place to': 'Acorns Health Solutions Private Limited',
-      'PO Number': 'PO10234', 'Qty Placed': 20, 'Reason': '' },
-    { 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules', 'Distributor Name order place to': 'Jeplus Healthcare Private Limited',
-      'PO Number': 'PO10235', 'Qty Placed': 10, 'Reason': '' },
-    { 'Item Name': 'Alex Cough Sugar Free Lozenges', 'Pack Size': '10 Lozenges', 'Distributor Name order place to': '',
-      'PO Number': '', 'Qty Placed': '', 'Reason': 'Short in Market' },
-    { 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet', 'Distributor Name order place to': '',
-      'PO Number': '', 'Qty Placed': '', 'Reason': 'Sufficient Stock' },
+    { 'Order Sheet Make Date': '02/09/26', 'Time': '11:30 AM', 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet',
+      'Closing Stock': 4, 'Closing (Strip)': 1, 'combine': 'Amlopres 5 Tablet30 Tablet', 'Type': 'Ok', 'Med Type': 'Fast',
+      'Order to Place': 20, 'Qty Placed': 20, 'Distributor Name(Order Placed)': 'Acorns Health Solutions Private Limited',
+      'PO Number': 'PO10234', 'PO Date': '02/09/26', 'PO Time': '01:15 PM', 'Reason': '' },
+    { 'Order Sheet Make Date': '02/09/26', 'Time': '11:30 AM', 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules',
+      'Closing Stock': 0, 'Closing (Strip)': 0, 'combine': 'Pan D Capsule15 Capsules', 'Type': 'Ok', 'Med Type': 'Fast',
+      'Order to Place': 10, 'Qty Placed': 10, 'Distributor Name(Order Placed)': 'Jeplus Healthcare Private Limited',
+      'PO Number': 'PO10235', 'PO Date': '02/09/26', 'PO Time': '01:20 PM', 'Reason': '' },
+    { 'Order Sheet Make Date': '02/09/26', 'Time': '11:30 AM', 'Item Name': 'Alex Cough Sugar Free Lozenges', 'Pack Size': '10 Lozenges',
+      'Closing Stock': 0, 'Closing (Strip)': 0, 'combine': 'Alex Cough Sugar Free Lozenges10 Lozenges', 'Type': 'Ok', 'Med Type': 'Fast',
+      'Order to Place': 11, 'Qty Placed': '', 'Distributor Name(Order Placed)': '',
+      'PO Number': '', 'PO Date': '', 'PO Time': '', 'Reason': 'Short in Market' },
+    { 'Order Sheet Make Date': '02/09/26', 'Time': '11:30 AM', 'Item Name': 'Mysoline 250 Tablet', 'Pack Size': '10 Tablet',
+      'Closing Stock': 12, 'Closing (Strip)': 2, 'combine': 'Mysoline 250 Tablet10 Tablet', 'Type': 'Ok', 'Med Type': 'Average',
+      'Order to Place': 3, 'Qty Placed': '', 'Distributor Name(Order Placed)': '',
+      'PO Number': '', 'PO Date': '', 'PO Time': '', 'Reason': 'Sufficient Stock' },
   ];
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
@@ -659,12 +667,35 @@ async function handleOrderSheetUpload(e){
   const dateTimeVal = document.getElementById('orderSheetDateTime').value;
   const resultEl = document.getElementById('orderSheetResult');
   if(!file) return;
-  if(!dateTimeVal){
-    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Please set the order date & time first.</p>`;
-    e.target.value = '';
-    return;
-  }
   resultEl.innerHTML = `<p class="no-history">Processing...</p>`;
+
+  function parseIndianDate(v){
+    if(v instanceof Date) return new Date(v);
+    const s = String(v||'').trim();
+    const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+    if(!m) return null;
+    let d = parseInt(m[1]), mo = parseInt(m[2]), y = parseInt(m[3]);
+    if(y < 100) y += 2000;
+    return new Date(y, mo-1, d);
+  }
+  function parseTimeString(v){
+    const s = String(v||'').trim();
+    const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if(!m) return { h:0, mnt:0 };
+    let h = parseInt(m[1]); const mnt = parseInt(m[2]); const ampm = m[3];
+    if(ampm){
+      if(/pm/i.test(ampm) && h !== 12) h += 12;
+      if(/am/i.test(ampm) && h === 12) h = 0;
+    }
+    return { h, mnt };
+  }
+  function combineDateTime(dateVal, timeVal){
+    const d = parseIndianDate(dateVal);
+    if(!d) return null;
+    const t = parseTimeString(timeVal);
+    d.setHours(t.h, t.mnt, 0, 0);
+    return d;
+  }
 
   const reader = new FileReader();
   reader.onload = async (evt)=>{
@@ -686,18 +717,22 @@ async function handleOrderSheetUpload(e){
     const itemCol = find('item', 'name') || find('item');
     const packCol = find('pack');
     const distCol = find('distributor');
-    const qtyCol = cols.find(c => /qty.*placed|placed.*qty/i.test(c))
-      || cols.find(c => {
-        const lc = c.toLowerCase().trim();
-        return (lc === 'qty' || lc.includes('qty')) && !lc.includes('to place') && !lc.includes('place)');
-      });
+    const qtyPlacedCol = cols.find(c => /qty.*placed|placed.*qty/i.test(c));
+    const legacyQtyCol = cols.find(c => {
+      const lc = c.toLowerCase().trim();
+      return (lc === 'qty' || lc.includes('qty')) && !lc.includes('to place') && !lc.includes('place)');
+    });
     const poCol = cols.find(c => /po\s*number|po\s*no\b/i.test(c));
     const reasonCol = cols.find(c => /reason/i.test(c));
+    const poDateCol = cols.find(c => /po\s*date/i.test(c));
+    const poTimeCol = cols.find(c => /po\s*time/i.test(c));
+    const makeDateCol = cols.find(c => /make\s*date|sheet.*date/i.test(c));
+    const makeTimeCol = cols.find(c => c.toLowerCase().trim() === 'time');
     // Feature 2 columns — all optional, only used if present
-    const stockLooseCol = find('stock', 'loose');
-    const stockStripCol = find('strip');
-    const medTypeCol = cols.find(c => c.toLowerCase().includes('type') && !c.toLowerCase().includes('distributor'));
-    const lastSaleCol = find('last', 'order', 'date') || find('last', 'sale');
+    const stockLooseCol = find('closing', 'stock') || find('stock', 'loose') || cols.find(c => /^stock$/i.test(c.trim()));
+    const stockStripCol = find('closing', 'strip') || find('strip');
+    const medTypeCol = cols.find(c => /med\s*type/i.test(c)) || cols.find(c => c.toLowerCase().includes('type') && !c.toLowerCase().includes('distributor'));
+    const lastSaleCol = find('last', 'sale', 'date') || find('last', 'sale');
     const salesCols = {
       sales_7d: cols.find(c=>/7\s*days?\s*sale/i.test(c)),
       sales_15d: cols.find(c=>/15\s*days?\s*sale/i.test(c)),
@@ -721,9 +756,14 @@ async function handleOrderSheetUpload(e){
       bills_120d: cols.find(c=>/bills?\(?120/i.test(c)),
     };
     const hasInventoryData = !!(stockLooseCol || stockStripCol || medTypeCol);
+    const hasOwnDates = !!(poDateCol || makeDateCol);
 
-    if(!itemCol || !qtyCol){
-      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns. Found: ${escapeHtml(cols.join(', '))}</p>`;
+    if(!itemCol || (!qtyPlacedCol && !legacyQtyCol)){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns (item name, qty). Found: ${escapeHtml(cols.join(', '))}</p>`;
+      return;
+    }
+    if(!hasOwnDates && !dateTimeVal){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">This file has no PO Date/Order Sheet Make Date columns — please set the "Order date & time" field above first.</p>`;
       return;
     }
 
@@ -739,6 +779,8 @@ async function handleOrderSheetUpload(e){
     });
     const distByName = Object.fromEntries((distData||[]).map(d=>[d.name.trim().toLowerCase(), d.id]));
     const distByAlias = Object.fromEntries((aliasData||[]).map(a=>[a.alias.trim().toLowerCase(), a.distributor_id]));
+    const itemNameById = {};
+    itemsData.forEach(i => { itemNameById[i.id] = i.item_name; });
 
     function resolveItem(name, pack){
       const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
@@ -755,31 +797,42 @@ async function handleOrderSheetUpload(e){
       return distByName[key] || distByAlias[key] || null;
     }
 
-    let itemUnmatched = 0, distUnmatched = 0;
-    const runItemsToInsert = [];
-    const invSnapshotsToInsert = [];
-    const runAtIso = new Date(dateTimeVal).toISOString();
+    let itemUnmatched = 0, distUnmatched = 0, dateInvalid = 0;
+    const groups = {}; // dateKey -> { runAt: Date, items: [], invSnapshots: [] }
+
     rows.forEach(r=>{
       const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
       if(!itemId){ itemUnmatched++; return; }
       const distId = distCol ? resolveDistributor(r[distCol]) : null;
       if(distCol && r[distCol] && !distId) distUnmatched++;
-      const qty = parseInt(r[qtyCol]) || 0;
+      const qtyPlaced = qtyPlacedCol ? (parseInt(r[qtyPlacedCol]) || 0) : (legacyQtyCol ? (parseInt(r[legacyQtyCol]) || 0) : 0);
       const reason = reasonCol ? String(r[reasonCol]||'').trim() : '';
       const poNumber = poCol ? String(r[poCol]||'').trim() : '';
-      const isOrdered = qty > 0 && distId;
-      const status = isOrdered ? 'ordered' : (reason ? 'not_ordered' : 'ordered');
-      runItemsToInsert.push({
-        item_id: itemId, qty: isOrdered ? qty : 0, distributor_id: isOrdered ? distId : null,
+
+      const poDateRaw = poDateCol ? r[poDateCol] : null;
+      const isOrdered = !!(poDateRaw && distId && qtyPlaced > 0);
+      const status = isOrdered ? 'ordered' : 'not_ordered';
+
+      let runAtDate = null;
+      if(isOrdered){
+        runAtDate = combineDateTime(poDateRaw, poTimeCol ? r[poTimeCol] : null);
+      } else if(makeDateCol && r[makeDateCol]){
+        runAtDate = combineDateTime(r[makeDateCol], makeTimeCol ? r[makeTimeCol] : null);
+      }
+      if(!runAtDate && dateTimeVal) runAtDate = new Date(dateTimeVal);
+      if(!runAtDate){ dateInvalid++; return; }
+
+      const dateKey = runAtDate.toISOString().slice(0,10);
+      if(!groups[dateKey]) groups[dateKey] = { runAt: runAtDate, items: [], invSnapshots: [] };
+      groups[dateKey].items.push({
+        item_id: itemId, qty: isOrdered ? qtyPlaced : 0, distributor_id: isOrdered ? distId : null,
         po_number: poNumber || null, reason: reason || null, status,
       });
 
       if(hasInventoryData){
         const numOrNull = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
-        invSnapshotsToInsert.push({
-          item_id: itemId,
-          warehouse_id: warehouseId,
-          snapshot_at: runAtIso,
+        groups[dateKey].invSnapshots.push({
+          item_id: itemId, warehouse_id: warehouseId, snapshot_at: runAtDate.toISOString(),
           stock_loose: numOrNull(stockLooseCol ? r[stockLooseCol] : null),
           closing_strip: numOrNull(stockStripCol ? r[stockStripCol] : null),
           med_type: medTypeCol ? r[medTypeCol] : null,
@@ -804,60 +857,57 @@ async function handleOrderSheetUpload(e){
       }
     });
 
-    if(!runItemsToInsert.length){
-      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be matched. ${itemUnmatched} rows had unrecognized items.</p>`;
+    const groupKeys = Object.keys(groups);
+    if(!groupKeys.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be processed. ${itemUnmatched} unmatched items, ${dateInvalid} rows with no usable date.</p>`;
       e.target.value = '';
       return;
     }
 
-    // ---- auto repeat-detection: has this item shown up in an order run
-    // for this warehouse in the last 7 days? replaces manual VLOOKUP ----
     resultEl.innerHTML = `<p class="no-history">Checking for repeats against the last 7 days...</p>`;
-    const allItemIds = [...new Set(runItemsToInsert.map(r => r.item_id))];
-    const sevenDaysAgo = new Date(new Date(dateTimeVal).getTime() - 7*24*60*60*1000).toISOString();
-    const { data: priorRuns } = await sb.from('order_run_items')
-      .select('item_id, order_runs!inner(run_at, warehouse_id)')
-      .in('item_id', allItemIds)
-      .eq('order_runs.warehouse_id', warehouseId)
-      .gte('order_runs.run_at', sevenDaysAgo)
-      .lt('order_runs.run_at', runAtIso);
-    const priorDatesByItem = {};
-    (priorRuns||[]).forEach(p => {
-      if(!priorDatesByItem[p.item_id]) priorDatesByItem[p.item_id] = [];
-      priorDatesByItem[p.item_id].push(p.order_runs.run_at);
-    });
-    const itemNameById = {};
-    itemsData.forEach(i => { itemNameById[i.id] = i.item_name; });
+    let itemsLogged = 0, invLogged = 0, invErrMsg = '', runErrMsg = '';
+    const allPriorDates = {}; // item_id -> [dates] across all groups
 
-    const { data: run, error: runErr } = await sb.from('order_runs')
-      .insert({ warehouse_id: warehouseId, run_at: runAtIso })
-      .select().single();
+    for(const dateKey of groupKeys){
+      const group = groups[dateKey];
+      const runAtIso = group.runAt.toISOString();
+      const groupItemIds = [...new Set(group.items.map(i => i.item_id))];
 
-    if(runErr || !run){
-      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't create order run: ${escapeHtml(runErr?.message || 'unknown error')}</p>`;
-      e.target.value = '';
-      return;
-    }
+      const sevenDaysBefore = new Date(group.runAt.getTime() - 7*24*60*60*1000).toISOString();
+      const { data: priorRuns } = await sb.from('order_run_items')
+        .select('item_id, order_runs!inner(run_at, warehouse_id)')
+        .in('item_id', groupItemIds)
+        .eq('order_runs.warehouse_id', warehouseId)
+        .gte('order_runs.run_at', sevenDaysBefore)
+        .lt('order_runs.run_at', runAtIso);
+      (priorRuns||[]).forEach(p => {
+        if(!allPriorDates[p.item_id]) allPriorDates[p.item_id] = [];
+        allPriorDates[p.item_id].push(p.order_runs.run_at);
+      });
 
-    const finalItems = runItemsToInsert.map(i => ({ ...i, order_run_id: run.id }));
-    const { error: itemsErr } = await sb.from('order_run_items').insert(finalItems);
-    const itemsLogged = itemsErr ? 0 : finalItems.length;
+      const { data: run, error: runErr } = await sb.from('order_runs')
+        .insert({ warehouse_id: warehouseId, run_at: runAtIso })
+        .select().single();
+      if(runErr || !run){ runErrMsg = runErr?.message || 'unknown error'; continue; }
 
-    let invLogged = 0, invErrMsg = '';
-    if(hasInventoryData && invSnapshotsToInsert.length){
-      for(let i=0; i<invSnapshotsToInsert.length; i+=500){
-        const chunk = invSnapshotsToInsert.slice(i, i+500);
-        const { error: invErr } = await sb.from('inventory_snapshots').insert(chunk);
-        if(!invErr) invLogged += chunk.length;
-        else invErrMsg = invErr.message;
+      const finalItems = group.items.map(i => ({ ...i, order_run_id: run.id }));
+      const { error: itemsErr } = await sb.from('order_run_items').insert(finalItems);
+      if(!itemsErr) itemsLogged += finalItems.length; else runErrMsg = itemsErr.message;
+
+      if(hasInventoryData && group.invSnapshots.length){
+        for(let i=0; i<group.invSnapshots.length; i+=500){
+          const chunk = group.invSnapshots.slice(i, i+500);
+          const { error: invErr } = await sb.from('inventory_snapshots').insert(chunk);
+          if(!invErr) invLogged += chunk.length; else invErrMsg = invErr.message;
+        }
       }
     }
 
-    const repeatCount = Object.keys(priorDatesByItem).length;
+    const repeatCount = Object.keys(allPriorDates).length;
     const repeatListHtml = repeatCount ? `
       <table class="summary" style="margin-top:10px;">
         <tr><th>Repeating item</th><th>Also ordered on</th></tr>
-        ${Object.entries(priorDatesByItem).map(([itemId, dates])=>`
+        ${Object.entries(allPriorDates).map(([itemId, dates])=>`
           <tr>
             <td>${escapeHtml(itemNameById[itemId]||'?')}</td>
             <td>${dates.map(d=>new Date(d).toLocaleDateString()).join(', ')}</td>
@@ -866,10 +916,11 @@ async function handleOrderSheetUpload(e){
       </table>
     ` : '';
 
-    resultEl.innerHTML = `<p class="no-history" style="color:${itemsErr ? 'var(--red)' : 'var(--green)'};">${itemsErr ? `Order run created but items failed to save: ${escapeHtml(itemsErr.message)}` : `Done — logged ${itemsLogged} items as one order run at ${new Date(dateTimeVal).toLocaleString()}.`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched — check name/pack spelling).` : ''}${distUnmatched ? ` ${distUnmatched} rows had a distributor name that didn't match any known distributor.` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows for Feature 2 analysis.${invErrMsg ? ` (Some snapshot rows failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>
+    resultEl.innerHTML = `<p class="no-history" style="color:${itemsLogged ? 'var(--green)' : 'var(--red)'};">${itemsLogged ? `Done — logged ${itemsLogged} items across ${groupKeys.length} order run(s) (grouped by date).` : `Nothing was saved.${runErrMsg ? ` Error: ${escapeHtml(runErrMsg)}` : ''}`}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched).` : ''}${distUnmatched ? ` ${distUnmatched} rows had an unrecognized distributor.` : ''}${dateInvalid ? ` ${dateInvalid} rows skipped (no usable date).` : ''}${hasInventoryData ? ` Also saved ${invLogged} inventory snapshot rows.${invErrMsg ? ` (Some failed: ${escapeHtml(invErrMsg)})` : ''}` : ''}</p>
     ${repeatCount ? `<p class="no-history" style="font-weight:600; color:var(--amber);">${repeatCount} item(s) are repeating from the last 7 days — no VLOOKUP needed, see below:</p>${repeatListHtml}` : `<p class="no-history" style="color:var(--green);">No repeats from the last 7 days.</p>`}`;
     e.target.value = '';
     loadRepeats();
+    loadQtyIncreaseSuggestions();
   };
   if(file.name.endsWith('.csv')) reader.readAsText(file);
   else reader.readAsArrayBuffer(file);
