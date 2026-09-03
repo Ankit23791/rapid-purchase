@@ -758,9 +758,12 @@ async function handleOrderSheetUpload(e){
     const hasInventoryData = !!(stockLooseCol || stockStripCol || medTypeCol);
     const hasOwnDates = !!(poDateCol || makeDateCol);
 
-    if(!itemCol || (!qtyPlacedCol && !legacyQtyCol)){
-      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find required columns (item name, qty). Found: ${escapeHtml(cols.join(', '))}</p>`;
+    if(!itemCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Couldn't find an item name column. Found: ${escapeHtml(cols.join(', '))}</p>`;
       return;
+    }
+    if(!qtyPlacedCol && !legacyQtyCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--amber);">No quantity column found — that's fine if this is a recommendation-only sheet (nothing ordered yet); all matched items will be logged as "not ordered". Continuing...</p>`;
     }
     if(!hasOwnDates && !dateTimeVal){
       resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">This file has no PO Date/Order Sheet Make Date columns — please set the "Order date & time" field above first.</p>`;
