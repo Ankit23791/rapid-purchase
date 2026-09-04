@@ -603,6 +603,9 @@ function repeatsTabHTML(){
     <div class="card">
       <h2>Repeat orders</h2>
       <p class="hint">Items ordered on 2+ different days recently for the selected warehouse. Cross-checked against purchase history to guess why it's repeating.</p>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-ghost" id="downloadRepeatOrdersBtn">Download Excel</button>
+      </div>
     </div>
     <div id="repeatsArea"></div>
     <div class="card">
@@ -634,6 +637,9 @@ function initRepeatsTab(){
   }
   loadRepeats();
   loadQtyIncreaseSuggestions();
+
+  const downloadRepeatBtn = document.getElementById('downloadRepeatOrdersBtn');
+  if(downloadRepeatBtn) downloadRepeatBtn.addEventListener('click', downloadRepeatOrdersExcel);
 }
 
 function downloadSampleOrderSheetFormat(){
@@ -1139,6 +1145,49 @@ async function loadRepeats(){
       </div>
     `;
   }).join('');
+}
+
+async function downloadRepeatOrdersExcel(){
+  const btn = document.getElementById('downloadRepeatOrdersBtn');
+  btn.disabled = true; btn.textContent = 'Preparing...';
+  const { data, error } = await sb.rpc('get_repeat_orders', { p_warehouse_id: state.currentWarehouse, p_days_back: 14 });
+  btn.disabled = false; btn.textContent = 'Download Excel';
+
+  if(error || !data || !data.length){
+    alert('No repeat orders to export for this warehouse right now.');
+    return;
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Repeat Orders');
+  const headers = ['Item Name', 'Pack Size', 'Item Code', 'Ordered On (days)', 'Order Dates', 'Latest Qty Ordered', 'Likely Reason'];
+  sheet.addRow(headers);
+  sheet.getRow(1).font = { bold: true };
+  sheet.columns = [
+    { width: 32 }, { width: 16 }, { width: 14 }, { width: 16 }, { width: 30 }, { width: 16 }, { width: 32 },
+  ];
+
+  const RED = 'FFF9D5D0', GREEN = 'FFDCF3E4';
+  data.forEach(r => {
+    const isProblem = r.likely_reason.includes('Not delivered');
+    const row = sheet.addRow([
+      r.item_name, r.pack_size || '', r.code || '', r.distinct_days,
+      r.run_dates.join(', '), r.latest_qty, r.likely_reason,
+    ]);
+    row.eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isProblem ? RED : GREEN } };
+    });
+  });
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  const blob = new Blob([buffer], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const whName = state.warehouses.find(w=>w.id===state.currentWarehouse)?.name || 'warehouse';
+  a.download = `repeat_orders_${whName}_${new Date().toISOString().slice(0,10)}.xlsx`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 async function loadQtyIncreaseSuggestions(){
