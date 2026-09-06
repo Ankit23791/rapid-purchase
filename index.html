@@ -961,24 +961,60 @@ async function loadPurchaseUploadLog(){
   if(!el) return;
   const warehouseId = document.getElementById('purchaseDataWarehouseSelect').value;
   el.innerHTML = `<p class="no-history">Loading...</p>`;
+
+  // Coverage comes from purchase_history itself, not the upload log —
+  // the log only gets a row when an upload saved something, so it drifts
+  // out of step with what is actually stored.
+  const [{ count }, firstRes, lastRes] = await Promise.all([
+    sb.from('purchase_history').select('id', { count: 'exact', head: true })
+      .eq('warehouse_id', warehouseId),
+    sb.from('purchase_history').select('purchase_date')
+      .eq('warehouse_id', warehouseId)
+      .order('purchase_date', { ascending: true }).limit(1),
+    sb.from('purchase_history').select('purchase_date')
+      .eq('warehouse_id', warehouseId)
+      .order('purchase_date', { ascending: false }).limit(1),
+  ]);
+
+  const firstDate = firstRes.data && firstRes.data[0] ? firstRes.data[0].purchase_date : null;
+  const lastDate = lastRes.data && lastRes.data[0] ? lastRes.data[0].purchase_date : null;
+
+  let banner;
+  if(!count || !firstDate){
+    banner = `<div class="item-row" style="border-color:var(--amber);">
+      <p class="no-history" style="font-style:normal; font-weight:600; color:var(--amber);">
+        No purchase data stored yet for this warehouse.
+      </p></div>`;
+  } else {
+    const nextDay = new Date(lastDate + 'T00:00:00');
+    nextDay.setDate(nextDay.getDate() + 1);
+    const fmt = d => new Date(d + 'T00:00:00').toLocaleDateString('en-GB',
+                     { day: '2-digit', month: 'short', year: 'numeric' });
+    banner = `<div class="item-row" style="border-color:var(--teal);">
+      <p class="no-history" style="font-style:normal; font-weight:600; color:var(--ink);">
+        Purchase data on record: ${fmt(firstDate)} &rarr; ${fmt(lastDate)}
+        · ${count.toLocaleString()} rows
+      </p>
+      <p class="no-history" style="font-style:normal; color:var(--teal-dark); font-weight:600;">
+        Next upload should start ${nextDay.toLocaleDateString('en-GB',
+          { day: '2-digit', month: 'short', year: 'numeric' })}
+      </p></div>`;
+  }
+
   const { data } = await sb.from('purchase_uploads_log')
     .select('*').eq('warehouse_id', warehouseId).order('date_from', { ascending: false });
-  if(!data || !data.length){
-    el.innerHTML = `<p class="no-history">No purchase data uploaded yet for this warehouse.</p>`;
-    return;
-  }
-  el.innerHTML = `
-    <table class="summary">
-      <tr><th>Date range covered</th><th>Rows</th><th>Uploaded</th></tr>
-      ${data.map(r=>`
-        <tr>
-          <td>${r.date_from} to ${r.date_to}</td>
-          <td>${r.row_count}</td>
-          <td>${new Date(r.uploaded_at).toLocaleString()}</td>
-        </tr>
-      `).join('')}
-    </table>
-  `;
+
+  el.innerHTML = banner + (!data || !data.length
+    ? `<p class="no-history">No upload history recorded yet.</p>`
+    : `<table class="summary" style="margin-top:10px;">
+        <tr><th>Date range covered</th><th>Rows</th><th>Uploaded</th></tr>
+        ${data.map(r => `
+          <tr>
+            <td>${r.date_from} to ${r.date_to}</td>
+            <td>${r.row_count}</td>
+            <td>${new Date(r.uploaded_at).toLocaleString()}</td>
+          </tr>`).join('')}
+      </table>`);
 }
 
 async function handlePurchaseDataUpload(e){
@@ -1005,7 +1041,11 @@ async function handlePurchaseDataUpload(e){
 
     const cols = Object.keys(rows[0]);
     const find = (...kw) => cols.find(c => kw.every(k => c.toLowerCase().includes(k)));
-    const itemCol = find('item','name') || find('medicine','name') || find('item');
+    const codeCol = find('item','code') || find('product','code')
+                    || cols.find(c => /^\s*code\s*$/i.test(c));
+    // exclude the code column, else "Item Code" is taken as the name
+    const itemCol = [find('item','name'), find('medicine','name'), find('item')]
+                    .find(c => c && c !== codeCol);
     const packCol = find('pack');
     const distCol = find('distributor');
     const inDateCol = cols.find(c => /\bin\b.*\bdate\b|\bdate\b.*\bin\b/i.test(c)) || find('purchase','date') || find('date');
@@ -1020,26 +1060,38 @@ async function handlePurchaseDataUpload(e){
       return;
     }
 
-    const itemsData = await fetchAllRows('items', 'id, item_name, pack_size');
+    const itemsData = await fetchAllRows('items', 'id, code, item_name, pack_size');
     const { data: distData } = await sb.from('distributors').select('id, name');
     const { data: aliasData } = await sb.from('distributor_aliases').select('alias, distributor_id');
     const nameToItems = {};
+    const codeToItem = {};
     itemsData.forEach(i => {
       const key = i.item_name.trim().toLowerCase();
       if(!nameToItems[key]) nameToItems[key] = [];
       nameToItems[key].push(i);
+      if(i.code) codeToItem[String(i.code).trim().toLowerCase()] = i.id;
     });
     const distByName = Object.fromEntries((distData||[]).map(d => [d.name.trim().toLowerCase(), d.id]));
     const distByAlias = Object.fromEntries((aliasData||[]).map(a => [a.alias.trim().toLowerCase(), a.distributor_id]));
 
-    function resolveItem(name, pack){
-      const candidates = nameToItems[String(name).trim().toLowerCase()] || [];
-      if(candidates.length === 1) return candidates[0].id;
+    // Try the item code first — it is exact, so spelling differences
+    // ("Aciloc 150 Tab" vs "Aciloc 150 Tablet") cannot break the match.
+    // Only if there is no code do we fall back to matching on the name,
+    // which keeps older files without a code column working.
+    function resolveItem(code, name, pack){
+      const c = String(code ?? '').trim().toLowerCase();
+      if(c && codeToItem[c]) return { id: codeToItem[c], how: 'code' };
+
+      const candidates = nameToItems[String(name ?? '').trim().toLowerCase()] || [];
+      if(candidates.length === 1) return { id: candidates[0].id, how: 'name' };
       if(candidates.length > 1 && pack){
-        const m = candidates.find(c => String(c.pack_size).toLowerCase().trim() === String(pack).toLowerCase().trim());
-        return m ? m.id : null;
+        const m = candidates.find(x => String(x.pack_size).toLowerCase().trim()
+                                       === String(pack).toLowerCase().trim());
+        if(m) return { id: m.id, how: 'name+pack' };
+        return { id: null, how: 'pack_mismatch' };
       }
-      return null;
+      if(candidates.length > 1) return { id: null, how: 'ambiguous' };
+      return { id: null, how: c ? 'code_not_found' : 'not_found' };
     }
     function resolveDistributor(name){
       const key = String(name).trim().toLowerCase();
@@ -1052,15 +1104,54 @@ async function handlePurchaseDataUpload(e){
     }
 
     let itemUnmatched = 0, distUnmatched = 0, dateInvalid = 0;
+    let matchedByCode = 0, matchedByName = 0;
     const toInsert = [];
     const dates = [];
-    rows.forEach(r => {
-      const itemId = resolveItem(r[itemCol], packCol ? r[packCol] : null);
-      if(!itemId){ itemUnmatched++; return; }
+    purchaseSkippedRows = [];
+
+    const REASON_TEXT = {
+      code_not_found: 'Item code not found in the item master — upload the item master first',
+      not_found:      'Item name not found, and no item code was given',
+      ambiguous:      'Name matches several pack sizes — add a pack size or an item code',
+      pack_mismatch:  'Pack size does not match any item with this name',
+    };
+
+    function noteSkip(r, idx, reason){
+      purchaseSkippedRows.push({
+        'Row': idx + 2,
+        'Item Code': codeCol ? (r[codeCol] ?? '') : '',
+        'Item Name': r[itemCol] ?? '',
+        'Pack Size': packCol ? (r[packCol] ?? '') : '',
+        'Distributor': r[distCol] ?? '',
+        'In Date': r[inDateCol] ?? '',
+        'Quantity': r[qtyCol] ?? '',
+        'Why it was skipped': reason,
+      });
+    }
+
+    rows.forEach((r, idx) => {
+      const res = resolveItem(codeCol ? r[codeCol] : null,
+                              r[itemCol], packCol ? r[packCol] : null);
+      if(!res.id){
+        itemUnmatched++;
+        noteSkip(r, idx, REASON_TEXT[res.how] || 'Item not matched');
+        return;
+      }
+      if(res.how === 'code') matchedByCode++; else matchedByName++;
+      const itemId = res.id;
+
       const distId = resolveDistributor(r[distCol]);
-      if(!distId){ distUnmatched++; return; }
+      if(!distId){
+        distUnmatched++;
+        noteSkip(r, idx, 'Distributor name not recognised — add it, or add an alias, in Admin');
+        return;
+      }
       const dateStr = parseDate(r[inDateCol]);
-      if(!dateStr){ dateInvalid++; return; }
+      if(!dateStr){
+        dateInvalid++;
+        noteSkip(r, idx, 'In Date could not be read — check for mixed date formats in the file');
+        return;
+      }
       dates.push(dateStr);
       const billDateStr = billDateCol ? parseDate(r[billDateCol]) : null;
 
@@ -1081,7 +1172,11 @@ async function handlePurchaseDataUpload(e){
     });
 
     if(!toInsert.length){
-      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No rows could be processed. ${itemUnmatched} item mismatches, ${distUnmatched} distributor mismatches, ${dateInvalid} invalid dates.</p>`;
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        No rows could be processed. ${itemUnmatched} item mismatches,
+        ${distUnmatched} distributor mismatches, ${dateInvalid} invalid dates.</p>`
+        + skippedRowsHTML();
+      attachSkippedDownloadHandler();
       e.target.value = '';
       return;
     }
@@ -1121,7 +1216,23 @@ async function handlePurchaseDataUpload(e){
       });
     }
 
-    resultEl.innerHTML = `<p class="no-history" style="color:${inserted===0 ? 'var(--red)' : 'var(--green)'};">${inserted > 0 ? `Done — logged ${inserted} purchase records (${dateFrom} to ${dateTo}).` : 'Nothing was saved.'}${itemUnmatched ? ` ${itemUnmatched} rows skipped (item not matched).` : ''}${distUnmatched ? ` ${distUnmatched} rows skipped (distributor not recognized).` : ''}${dateInvalid ? ` ${dateInvalid} rows skipped (invalid date).` : ''}${lastError ? ` Some rows failed: ${escapeHtml(lastError.message)}` : ''}</p>`;
+    const totalSkipped = itemUnmatched + distUnmatched + dateInvalid;
+    resultEl.innerHTML = `
+      <p class="no-history" style="color:${inserted===0 ? 'var(--red)' : 'var(--green)'}; font-style:normal; font-weight:600;">
+        ${inserted > 0
+          ? `Done — logged ${inserted} purchase records (${dateFrom} to ${dateTo}).`
+          : 'Nothing was saved.'}
+        ${lastError ? `<br><span style="color:var(--red);">Some rows failed: ${escapeHtml(lastError.message)}</span>` : ''}
+      </p>
+      <p class="no-history">
+        Matched by item code: ${matchedByCode} ·
+        Matched by name: ${matchedByName}${matchedByName
+          ? ` <span style="color:var(--amber);">(add an Item Code column so these match exactly too)</span>`
+          : ''}
+        ${totalSkipped ? ` · <strong style="color:var(--red);">Skipped: ${totalSkipped}</strong>` : ''}
+      </p>`
+      + skippedRowsHTML();
+    attachSkippedDownloadHandler();
     e.target.value = '';
     loadPurchaseUploadLog();
   };
