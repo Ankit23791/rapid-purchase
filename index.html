@@ -394,6 +394,11 @@ function attachTabHandlers(){
   const addDistForm = document.getElementById('addDistributorForm');
   if(addDistForm) addDistForm.addEventListener('submit', handleAddDistributor);
 
+  const exportItemMasterBtn = document.getElementById('exportItemMasterBtn');
+  if(exportItemMasterBtn) exportItemMasterBtn.addEventListener('click', exportItemMaster);
+  const itemMasterInput = document.getElementById('itemMasterInput');
+  if(itemMasterInput) itemMasterInput.addEventListener('change', handleItemMasterUpload);
+
   const testPharmarackBtn = document.getElementById('testPharmarackBtn');
   if(testPharmarackBtn) testPharmarackBtn.addEventListener('click', testPharmarackConnection);
 
@@ -2471,6 +2476,27 @@ function adminTabHTML(){
       </div>
     </div>
     <div class="card">
+      <h2>Item master</h2>
+      <p class="hint">The master list of every medicine. A medicine must exist here before a
+      purchase for it can be recorded. <strong>Export</strong> downloads the current list;
+      edit it in Excel and <strong>upload</strong> the same file back. Nothing is ever deleted
+      by an upload — it only adds new medicines and updates existing ones.</p>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-ghost" id="exportItemMasterBtn">Export item master</button>
+        <label class="btn btn-primary" style="position:relative;">
+          Upload item master
+          <input type="file" id="itemMasterInput" accept=".csv,.xlsx,.xls"
+                 style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns:
+        <span class="mono">Item Code</span>, <span class="mono">Item Name</span>,
+        <span class="mono">Pack Size</span> (optional). Extra columns are ignored.
+        <strong>Never change a code once it is in use</strong> — the app treats a changed code
+        as a brand new medicine, and the old one keeps all its history.</p>
+      <div id="itemMasterResult"></div>
+    </div>
+    <div class="card">
       <h2>Warehouses</h2>
       <ul class="admin-list">
         ${state.warehouses.map(w=>`<li><span>${escapeHtml(w.name)}</span><span class="mono" style="color:var(--muted); font-size:12px;">${w.id.slice(0,8)}</span></li>`).join('')}
@@ -2486,6 +2512,258 @@ function adminTabHTML(){
       <div id="pharmarackTestResult"></div>
     </div>
   `;
+}
+
+// ============================================================
+// ITEM MASTER — EXPORT & UPLOAD
+// Columns: Item Code, Item Name, Pack Size.
+// Export and upload share one format, so you can export,
+// edit in Excel, and upload the same file back.
+// Upsert relies on the unique index uq_items_code.
+// ============================================================
+
+// Holds the parsed upload between preview and confirm.
+let itemMasterPending = null;
+
+async function exportItemMaster(){
+  const btn = document.getElementById('exportItemMasterBtn');
+  const resultEl = document.getElementById('itemMasterResult');
+  btn.disabled = true;
+  btn.textContent = 'Preparing...';
+  try {
+    const rows = await fetchAllRows('items', 'code, item_name, pack_size');
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No items found — the master list is empty.</p>`;
+      return;
+    }
+    rows.sort((a, b) => String(a.item_name || '').localeCompare(String(b.item_name || '')));
+
+    const out = rows.map(r => ({
+      'Item Code': r.code || '',
+      'Item Name': r.item_name || '',
+      'Pack Size': r.pack_size || '',
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(out);
+    ws['!cols'] = [{ wch: 16 }, { wch: 42 }, { wch: 18 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Item Master');
+    XLSX.writeFile(wb, `item_master_${new Date().toISOString().slice(0, 10)}.xlsx`);
+
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--green);">Exported ${rows.length} items.</p>`;
+  } catch(err){
+    resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Export failed: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Export item master';
+  }
+}
+
+// Step 1 — read, check, preview. Nothing is saved yet.
+function handleItemMasterUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('itemMasterResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Reading file...</p>`;
+  itemMasterPending = null;
+
+  const reader = new FileReader();
+  reader.onload = async (evt) => {
+    let rows;
+    try {
+      const wb = file.name.toLowerCase().endsWith('.csv')
+        ? XLSX.read(evt.target.result, { type: 'string' })
+        : XLSX.read(evt.target.result, { type: 'array' });
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } catch(err){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Could not read the file: ${escapeHtml(err.message)}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">The file appears to be empty.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...kw) => cols.find(c => kw.every(k => c.toLowerCase().includes(k)));
+    const codeCol = find('item', 'code') || find('product', 'code')
+                    || cols.find(c => /^\s*code\s*$/i.test(c));
+    // exclude the code column so "Item Code" is never mistaken for the name
+    const nameCol = [find('item', 'name'), find('medicine', 'name'),
+                     find('product', 'name'), find('name')]
+                    .find(c => c && c !== codeCol);
+    const packCol = find('pack');
+
+    if(!codeCol || !nameCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        Couldn't find the required columns. Need an item code column and an item name column.<br>
+        Found: ${escapeHtml(cols.join(', '))}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    const seen = new Set();
+    const parsed = [];
+    let blankRows = 0;
+    const dupeCodes = [];
+
+    rows.forEach(r => {
+      const code = String(r[codeCol] ?? '').trim();
+      const name = String(r[nameCol] ?? '').trim();
+      const pack = packCol ? String(r[packCol] ?? '').trim() : '';
+      if(!code || !name){ blankRows++; return; }
+      if(seen.has(code)){ dupeCodes.push(code); return; }
+      seen.add(code);
+      parsed.push({ code, item_name: name, pack_size: pack });
+    });
+
+    if(dupeCodes.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        <strong>Stopped — the file has ${dupeCodes.length} duplicate code(s).</strong>
+        Each code may appear only once. Fix the file and try again.<br>
+        First few: ${escapeHtml([...new Set(dupeCodes)].slice(0, 10).join(', '))}</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    if(!parsed.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">No usable rows — every row was missing a code or a name.</p>`;
+      e.target.value = '';
+      return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history">Comparing against the current master list...</p>`;
+    const existing = await fetchAllRows('items', 'id, code, item_name, pack_size');
+    const byCode = {};
+    existing.forEach(i => { byCode[String(i.code).trim()] = i; });
+
+    const toCreate = [], toUpdate = [];
+    let unchanged = 0;
+
+    parsed.forEach(p => {
+      const cur = byCode[p.code];
+      if(!cur){ toCreate.push(p); return; }
+      // a blank pack size in the file must not erase an existing one
+      const newPack = p.pack_size || (cur.pack_size || '');
+      const nameChanged = String(cur.item_name || '').trim() !== p.item_name;
+      const packChanged = String(cur.pack_size || '').trim() !== newPack;
+      if(nameChanged || packChanged){
+        toUpdate.push({
+          code: p.code, item_name: p.item_name, pack_size: newPack,
+          _oldName: cur.item_name, _oldPack: cur.pack_size,
+        });
+      } else {
+        unchanged++;
+      }
+    });
+
+    itemMasterPending = { toCreate, toUpdate };
+
+    const changeList = toUpdate.length ? `
+      <table class="summary" style="margin-top:10px;">
+        <tr><th>Code</th><th>Was</th><th>Will become</th></tr>
+        ${toUpdate.slice(0, 15).map(u => `
+          <tr>
+            <td class="mono">${escapeHtml(u.code)}</td>
+            <td style="color:var(--muted);">${escapeHtml(u._oldName || '')}${u._oldPack ? ' · ' + escapeHtml(u._oldPack) : ''}</td>
+            <td>${escapeHtml(u.item_name)}${u.pack_size ? ' · ' + escapeHtml(u.pack_size) : ''}</td>
+          </tr>`).join('')}
+      </table>
+      ${toUpdate.length > 15 ? `<p class="no-history">...and ${toUpdate.length - 15} more.</p>` : ''}
+    ` : '';
+
+    const newList = toCreate.length ? `
+      <table class="summary" style="margin-top:10px;">
+        <tr><th>Code</th><th>New medicine</th></tr>
+        ${toCreate.slice(0, 15).map(c => `
+          <tr>
+            <td class="mono">${escapeHtml(c.code)}</td>
+            <td>${escapeHtml(c.item_name)}${c.pack_size ? ' · ' + escapeHtml(c.pack_size) : ''}</td>
+          </tr>`).join('')}
+      </table>
+      ${toCreate.length > 15 ? `<p class="no-history">...and ${toCreate.length - 15} more.</p>` : ''}
+    ` : '';
+
+    resultEl.innerHTML = `
+      <div class="item-row" style="margin-top:14px;">
+        <p class="no-history" style="font-style:normal; font-weight:600; color:var(--ink);">
+          ${parsed.length} rows read${blankRows ? ` · ${blankRows} skipped (no code or name)` : ''}
+        </p>
+        <p class="no-history" style="font-style:normal;">
+          <strong style="color:var(--green);">New medicines: ${toCreate.length}</strong> ·
+          <strong style="color:var(--amber);">Updates to existing: ${toUpdate.length}</strong> ·
+          Unchanged: ${unchanged}
+        </p>
+        ${toUpdate.length ? `<p class="no-history" style="color:var(--amber); font-style:normal; font-weight:600;">
+          Check the updates below before confirming. If you expected none, something is wrong with the file.
+        </p>` : ''}
+        ${changeList}
+        ${newList}
+        ${(toCreate.length + toUpdate.length) === 0
+          ? `<p class="no-history" style="color:var(--green); font-style:normal; font-weight:600;">Nothing to change — the master list already matches this file.</p>`
+          : `<div class="btn-row">
+               <button class="btn btn-primary" id="confirmItemMasterBtn">
+                 Confirm — save ${toCreate.length} new, ${toUpdate.length} updated
+               </button>
+               <button class="btn btn-ghost" id="cancelItemMasterBtn">Cancel</button>
+             </div>`}
+      </div>`;
+
+    const confirmBtn = document.getElementById('confirmItemMasterBtn');
+    if(confirmBtn) confirmBtn.addEventListener('click', confirmItemMasterUpload);
+    const cancelBtn = document.getElementById('cancelItemMasterBtn');
+    if(cancelBtn) cancelBtn.addEventListener('click', () => {
+      itemMasterPending = null;
+      resultEl.innerHTML = `<p class="no-history">Cancelled — nothing was saved.</p>`;
+    });
+
+    e.target.value = '';
+  };
+
+  if(file.name.toLowerCase().endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+// Step 2 — save, only after Confirm.
+async function confirmItemMasterUpload(){
+  if(!itemMasterPending) return;
+  const btn = document.getElementById('confirmItemMasterBtn');
+  const resultEl = document.getElementById('itemMasterResult');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  const payload = [
+    ...itemMasterPending.toCreate,
+    ...itemMasterPending.toUpdate,
+  ].map(p => ({
+    code: p.code,
+    item_name: p.item_name,
+    pack_size: p.pack_size || null,
+  }));
+
+  let saved = 0, lastError = null;
+  for(let i = 0; i < payload.length; i += 500){
+    const chunk = payload.slice(i, i + 500);
+    const { error } = await sb.from('items').upsert(chunk, { onConflict: 'code' });
+    if(!error) saved += chunk.length; else lastError = error;
+    btn.textContent = `Saving... ${Math.min(i + 500, payload.length)} / ${payload.length}`;
+  }
+
+  const created = itemMasterPending.toCreate.length;
+  const updated = itemMasterPending.toUpdate.length;
+  itemMasterPending = null;
+
+  resultEl.innerHTML = saved
+    ? `<p class="no-history" style="color:var(--green); font-style:normal; font-weight:600;">
+         Done — ${created} new medicine(s) added, ${updated} updated.
+         ${lastError ? `<br><span style="color:var(--red);">Some rows failed: ${escapeHtml(lastError.message)}</span>` : ''}
+       </p>`
+    : `<p class="no-history" style="color:var(--red);">
+         Nothing was saved.${lastError ? ` Error: ${escapeHtml(lastError.message)}` : ''}
+       </p>`;
 }
 
 async function handleAddWarehouse(e){
