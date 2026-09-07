@@ -241,6 +241,7 @@ function renderMain(){
     <div class="tabs">
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
+      <button data-tab="afternoon" class="${state.activeTab==='afternoon'?'active':''}">Afternoon Check</button>
       <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
       <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
@@ -270,6 +271,7 @@ function renderTabContent(){
   else if(state.activeTab === 'repeats'){ el.innerHTML = repeatsTabHTML(); initRepeatsTab(); }
   else if(state.activeTab === 'inventory'){ el.innerHTML = inventoryTabHTML(); loadInventoryAnalysis(); }
   else if(state.activeTab === 'refill'){ el.innerHTML = refillTabHTML(); initRefillTab(); }
+  else if(state.activeTab === 'afternoon'){ el.innerHTML = afternoonTabHTML(); initAfternoonTab(); }
   else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
   else el.innerHTML = adminTabHTML();
   attachTabHandlers();
@@ -1100,10 +1102,47 @@ async function handlePurchaseDataUpload(e){
       const key = String(name).trim().toLowerCase();
       return distByName[key] || distByAlias[key] || null;
     }
+    // Dates are read DAY FIRST (03/08/26 = 3 August), the format used here.
+    // Never hand a string to new Date(): it reads DD/MM/YY as American
+    // MM/DD/YY, so 03/08/26 silently becomes 8 March and 31/07/26 is
+    // rejected outright. Anything not clearly understood returns null and
+    // the row is reported as skipped, rather than saved with a wrong date.
     function parseDate(v){
-      if(v instanceof Date) return v.toISOString().slice(0,10);
-      const d = new Date(v);
-      return isNaN(d) ? null : d.toISOString().slice(0,10);
+      // build the string from local parts — toISOString() would shift
+      // the date back a day in IST
+      const toISO = dt => `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+      const valid = (y, mo, d) => {
+        if(d < 1 || d > 31 || mo < 1 || mo > 12 || y < 1900 || y > 2200) return null;
+        const dt = new Date(y, mo - 1, d);
+        // catches impossible dates such as 31/02
+        if(dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+        return toISO(dt);
+      };
+
+      if(v instanceof Date) return isNaN(v) ? null : toISO(v);
+
+      // Excel stores dates as a serial number when the cell is a real date
+      if(typeof v === 'number' && isFinite(v) && v > 0){
+        const dt = new Date(Math.round((v - 25569) * 86400000));
+        return isNaN(dt) ? null : valid(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate());
+      }
+
+      const s = String(v ?? '').trim();
+      if(!s) return null;
+
+      // DD/MM/YY, DD-MM-YYYY, DD.MM.YY
+      let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+      if(m){
+        let y = parseInt(m[3], 10);
+        if(y < 100) y += 2000;
+        return valid(y, parseInt(m[2], 10), parseInt(m[1], 10));
+      }
+
+      // YYYY-MM-DD
+      m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
+      if(m) return valid(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10));
+
+      return null;
     }
 
     let itemUnmatched = 0, distUnmatched = 0, dateInvalid = 0;
@@ -1152,7 +1191,7 @@ async function handlePurchaseDataUpload(e){
       const dateStr = parseDate(r[inDateCol]);
       if(!dateStr){
         dateInvalid++;
-        noteSkip(r, idx, 'In Date could not be read — check for mixed date formats in the file');
+        noteSkip(r, idx, `In Date "${String(r[inDateCol] ?? '')}" could not be read — use DD/MM/YY or YYYY-MM-DD`);
         return;
       }
       dates.push(dateStr);
@@ -1460,12 +1499,17 @@ async function loadAnalysisSummaries(){
       </table>`;
 }
 
-async function fetchAllRows(table, columns){
+// The optional `filter` is a function that receives the query and returns
+// it with .eq()/.gte()/etc applied — without it a caller that needs a
+// subset silently pulls the whole table.
+async function fetchAllRows(table, columns, filter){
   let all = [];
   let from = 0;
   const pageSize = 1000;
   while(true){
-    const { data, error } = await sb.from(table).select(columns).range(from, from + pageSize - 1);
+    let q = sb.from(table).select(columns);
+    if(typeof filter === 'function') q = filter(q);
+    const { data, error } = await q.range(from, from + pageSize - 1);
     if(error || !data || !data.length) break;
     all = all.concat(data);
     if(data.length < pageSize) break;
@@ -1510,6 +1554,48 @@ async function handleAnalysisUpload(e){
     }
     const num = v => (v === undefined || v === null || v === '') ? null : (parseFloat(v) || 0);
 
+    // Your Python output was renamed to plainer headings ("Qty Sold (30d)"
+    // instead of "Total Qty Sold (30d)"). pick() accepts the new name first
+    // and the old one as a fallback, so both versions of the file work.
+    const pick = (row, ...names) => {
+      for(const n of names){
+        const v = row[n];
+        if(v !== undefined && v !== null && String(v).trim() !== '') return v;
+      }
+      return null;
+    };
+    const yesNo = v => {
+      if(v === null || v === undefined) return null;
+      const s = String(v).trim().toLowerCase();
+      if(['yes','y','true','1'].includes(s)) return true;
+      if(['no','n','false','0'].includes(s)) return false;
+      return null;
+    };
+    // "06 Sep 2026" and "06/09/26" are both day-first
+    const parseAnalysisDate = v => {
+      if(!v) return null;
+      if(v instanceof Date && !isNaN(v))
+        return `${v.getFullYear()}-${String(v.getMonth()+1).padStart(2,'0')}-${String(v.getDate()).padStart(2,'0')}`;
+      const s = String(v).trim();
+      let m = s.match(/^(\d{1,2})[\s\/\-]([A-Za-z]{3,})[\s\/\-](\d{2,4})$/);
+      if(m){
+        const mo = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec']
+                   .indexOf(m[2].slice(0,3).toLowerCase());
+        if(mo >= 0){
+          let y = parseInt(m[3],10); if(y < 100) y += 2000;
+          return `${y}-${String(mo+1).padStart(2,'0')}-${String(parseInt(m[1],10)).padStart(2,'0')}`;
+        }
+      }
+      m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+      if(m){
+        let y = parseInt(m[3],10); if(y < 100) y += 2000;
+        return `${y}-${String(parseInt(m[2],10)).padStart(2,'0')}-${String(parseInt(m[1],10)).padStart(2,'0')}`;
+      }
+      m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if(m) return `${m[1]}-${String(+m[2]).padStart(2,'0')}-${String(+m[3]).padStart(2,'0')}`;
+      return null;
+    };
+
     let unmatched = 0;
     const toInsert = [];
     rows.forEach(r=>{
@@ -1517,26 +1603,97 @@ async function handleAnalysisUpload(e){
       if(!itemId){ unmatched++; return; }
       toInsert.push({
         warehouse_id: warehouseId, item_id: itemId, snapshot_date: snapshotDate,
-        medicine_type: r['Medicine Type'], stock_logic: r['Stock Logic'], demand_pattern: r['Demand Pattern'],
-        momentum: r['Momentum (15d vs 30d)'],
-        bills_7d: num(r['Total Bills (7d)']), unique_cust_7d: num(r['Unique Customers (7d)']), qty_7d: num(r['Total Qty Sold (7d)']),
-        bills_15d: num(r['Total Bills (15d)']), unique_cust_15d: num(r['Unique Customers (15d)']), qty_15d: num(r['Total Qty Sold (15d)']),
-        bills_30d: num(r['Total Bills (30d)']), days_sold_30d: num(r['Days Sold (30d)']), qty_30d: num(r['Total Qty Sold (30d)']),
-        clean_qty_30d: num(r['Clean Qty Sold (30d)']), outlier_bills: num(r['Outlier Bills']), max_qty_single_bill: num(r['Max Qty Single Bill']),
-        percentile_95: num(r['Percentile 95']),
-        qty_45d: num(r['Total Qty Sold (45d)']), bills_45d: num(r['Total Bills (45d)']), unique_cust_45d: num(r['Unique Customers (45d)']),
-        qty_60d: num(r['Total Qty Sold (60d)']), bills_60d: num(r['Total Bills (60d)']), unique_cust_60d: num(r['Unique Customers (60d)']),
-        qty_90d: num(r['Total Qty Sold (90d)']), bills_90d: num(r['Total Bills (90d)']), unique_cust_90d: num(r['Unique Customers (90d)']),
-        qty_120d: num(r['Total Qty Sold (120d)']), bills_120d: num(r['Total Bills (120d)']), unique_cust_120d: num(r['Unique Customers (120d)']),
-        qty_180d: num(r['Total Qty Sold (180d)']), bills_180d: num(r['Total Bills (180d)']), unique_cust_180d: num(r['Unique Customers (180d)']),
-        last_order_date: r['Last Order Date'] || null,
-        days_since_last_order: num(r['Days Since Last Order']),
-        daily_avg_30d: num(r['Daily Avg (30d)']), avg_per_days_sold: num(r['Avg per Days Sold']), max_daily_sale: num(r['Max Daily Sale']),
-        unique_cust_30d: num(r['Unique Customers (30d)']), avg_visits_per_cust: num(r['Avg Visits/Customer']),
-        avg_cust_per_day: num(r['Avg Customers Per Day']), same_day_customers: num(r['Same Day Customers']),
-        avg_gap_between_sales_d: num(r['Avg Gap Between Sales (d)']),
-        q1: num(r['Q1']), q3: num(r['Q3']), upper_fence_iqr: num(r['Upper Fence IQR']), outlier_verdict: r['Outlier Verdict'],
-        min_stock: num(r['Min Stock']), max_stock: num(r['Max Stock']), reorder_qty: num(r['Reorder Qty']),
+
+        // Group / pattern
+        medicine_type:  pick(r, 'Group', 'Medicine Type'),
+        stock_logic:    pick(r, 'Why This Stock Level', 'Stock Logic'),
+        demand_pattern: pick(r, 'Selling Pattern', 'Demand Pattern'),
+        momentum:       pick(r, 'Speed Change (15d vs 30d)', 'Momentum (15d vs 30d)'),
+        trend:          pick(r, 'Trend'),
+        growing:        pick(r, 'Growing'),
+        chronic:        pick(r, 'Chronic (your list)'),
+
+        // The gate: "Yes" / "No" -> true / false
+        can_order:      yesNo(pick(r, 'Can Order')),
+        stock_warning:  pick(r, 'Stock Warning'),
+
+        // Quantity sold
+        qty_7d:   num(pick(r, 'Qty Sold (7d)',   'Total Qty Sold (7d)')),
+        qty_15d:  num(pick(r, 'Qty Sold (15d)',  'Total Qty Sold (15d)')),
+        qty_30d:  num(pick(r, 'Qty Sold (30d)',  'Total Qty Sold (30d)')),
+        qty_45d:  num(pick(r, 'Qty Sold (45d)',  'Total Qty Sold (45d)')),
+        qty_60d:  num(pick(r, 'Qty Sold (60d)',  'Total Qty Sold (60d)')),
+        qty_90d:  num(pick(r, 'Qty Sold (90d)',  'Total Qty Sold (90d)')),
+        qty_120d: num(pick(r, 'Qty Sold (120d)', 'Total Qty Sold (120d)')),
+        qty_180d: num(pick(r, 'Qty Sold (180d)', 'Total Qty Sold (180d)')),
+        qty_270d: num(pick(r, 'Qty Sold (270d)')),
+        qty_360d: num(pick(r, 'Qty Sold (360d)')),
+
+        // Bills
+        bills_7d:   num(pick(r, 'No of Bills (7d)',   'Total Bills (7d)')),
+        bills_15d:  num(pick(r, 'No of Bills (15d)',  'Total Bills (15d)')),
+        bills_30d:  num(pick(r, 'No of Bills (30d)',  'Total Bills (30d)')),
+        bills_45d:  num(pick(r, 'No of Bills (45d)',  'Total Bills (45d)')),
+        bills_60d:  num(pick(r, 'No of Bills (60d)',  'Total Bills (60d)')),
+        bills_90d:  num(pick(r, 'No of Bills (90d)',  'Total Bills (90d)')),
+        bills_120d: num(pick(r, 'No of Bills (120d)', 'Total Bills (120d)')),
+        bills_180d: num(pick(r, 'No of Bills (180d)', 'Total Bills (180d)')),
+        bills_270d: num(pick(r, 'No of Bills (270d)')),
+        bills_360d: num(pick(r, 'No of Bills (360d)')),
+
+        // Customers
+        unique_cust_7d:   num(pick(r, 'Customers (7d)',   'Unique Customers (7d)')),
+        unique_cust_15d:  num(pick(r, 'Customers (15d)',  'Unique Customers (15d)')),
+        unique_cust_30d:  num(pick(r, 'Customers (30d)',  'Unique Customers (30d)')),
+        unique_cust_45d:  num(pick(r, 'Customers (45d)',  'Unique Customers (45d)')),
+        unique_cust_60d:  num(pick(r, 'Customers (60d)',  'Unique Customers (60d)')),
+        unique_cust_90d:  num(pick(r, 'Customers (90d)',  'Unique Customers (90d)')),
+        unique_cust_120d: num(pick(r, 'Customers (120d)', 'Unique Customers (120d)')),
+        unique_cust_180d: num(pick(r, 'Customers (180d)', 'Unique Customers (180d)')),
+        unique_cust_270d: num(pick(r, 'Customers (270d)')),
+        unique_cust_360d: num(pick(r, 'Customers (360d)')),
+
+        // Stock levels — what the afternoon check reads
+        min_stock:   num(pick(r, 'Min Stock')),
+        max_stock:   num(pick(r, 'Max Stock')),
+        reorder_qty: num(pick(r, 'Order Qty', 'Reorder Qty')),
+        top_up_by:   num(pick(r, 'Top Up By')),
+        closing_stock: num(pick(r, 'Closing Stock')),
+        stock_will_last_days: num(pick(r, 'Stock Will Last (days)')),
+
+        // Sale sizing
+        strips_per_day:    num(pick(r, 'Strips Sold Per Day')),
+        normal_sale_size:  num(pick(r, 'Normal Sale Size')),
+        big_sale_size:     num(pick(r, 'Big Sale Size')),
+        biggest_ever_sale: num(pick(r, 'Biggest Ever Sale')),
+        max_daily_sale:    num(pick(r, 'Biggest Single Day', 'Max Daily Sale')),
+
+        // Consistency
+        weeks_sold_in:      num(pick(r, 'Weeks Sold In (of 13)')),
+        days_selling:       num(pick(r, 'Days This Medicine Selling')),
+        sales_per_week_30d: num(pick(r, 'Sales Per Week (30d)')),
+        sales_per_week_90d: num(pick(r, 'Sales Per Week (90d)')),
+        days_sold_30d:      num(pick(r, 'Days Sold On (30d)', 'Days Sold (30d)')),
+        clean_qty_30d:      num(pick(r, 'Normal Qty Sold (30d)', 'Clean Qty Sold (30d)')),
+
+        // Outliers
+        outlier_bills:       num(pick(r, 'Odd Sales Found', 'Outlier Bills')),
+        outlier_verdict:     pick(r, 'Odd Sale Note', 'Outlier Verdict'),
+        max_qty_single_bill: num(pick(r, 'Max Qty Single Bill')),
+        percentile_95:       num(pick(r, 'Percentile 95')),
+        q1:                  num(pick(r, 'Q1')),
+        q3:                  num(pick(r, 'Q3')),
+        upper_fence_iqr:     num(pick(r, 'Upper Fence IQR')),
+
+        // Recency and rhythm
+        last_order_date:         parseAnalysisDate(pick(r, 'Last Sold Date', 'Last Order Date')),
+        days_since_last_order:   num(pick(r, 'Days Since Last Sale', 'Days Since Last Order')),
+        avg_gap_between_sales_d: num(pick(r, 'Avg Gap Between Sales (days)', 'Avg Gap Between Sales (d)')),
+        daily_avg_30d:           num(pick(r, 'Daily Avg (30d)')),
+        avg_per_days_sold:       num(pick(r, 'Avg per Days Sold')),
+        avg_visits_per_cust:     num(pick(r, 'Avg Visits Per Customer', 'Avg Visits/Customer')),
+        avg_cust_per_day:        num(pick(r, 'Avg Customers Per Day')),
+        same_day_customers:      num(pick(r, 'Days With Many Customers', 'Same Day Customers')),
       });
     });
 
@@ -2561,6 +2718,462 @@ async function rejectItem(itemId){
 // ============================================================
 // ADMIN TAB
 // ============================================================
+// ============================================================
+// AFTERNOON CHECK
+// The team uploads item name, pack size and current stock.
+// The app answers order / skip / blocked for each one, using
+// min & max from the latest analysis snapshot, and warns when
+// something was already ordered in the last 3 days.
+// It never calculates min/max itself — those come from the
+// Python analysis upload.
+// ============================================================
+
+const AFT = {
+  rows: [],          // one entry per uploaded line, with its verdict
+  distributors: [],
+  snapshotDate: null,
+  warehouseId: null,
+};
+
+const AFT_LOOKBACK_DAYS = 3;
+
+function afternoonTabHTML(){
+  return `
+    <div class="card">
+      <h2>Afternoon check</h2>
+      <p class="hint">Upload the item list with current stock and the app will say what to order.
+      It uses min &amp; max from the latest analysis upload, and flags anything already ordered
+      in the last ${AFT_LOOKBACK_DAYS} days so nothing gets ordered twice.</p>
+      <label>Warehouse</label>
+      <select id="aftWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div id="aftStatusArea"></div>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload stock list
+          <input type="file" id="aftInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="aftSampleBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns:
+        <span class="mono">Item Name</span>, <span class="mono">Pack Size</span>,
+        <span class="mono">Closing (Strip)</span>. Optional:
+        <span class="mono">Item Code</span> (matches exactly — best if you have it) and
+        <span class="mono">Current Stock(Loose)</span>. Extra columns are ignored.</p>
+      <div id="aftResult"></div>
+    </div>`;
+}
+
+async function initAfternoonTab(){
+  const sel = document.getElementById('aftWarehouseSelect');
+  AFT.warehouseId = sel.value;
+  sel.addEventListener('change', ()=>{
+    AFT.warehouseId = sel.value;
+    AFT.rows = [];
+    document.getElementById('aftResult').innerHTML = '';
+    loadAfternoonStatus();
+  });
+  document.getElementById('aftInput').addEventListener('change', handleAfternoonUpload);
+  document.getElementById('aftSampleBtn').addEventListener('click', downloadAfternoonSample);
+  loadAfternoonStatus();
+}
+
+// ------------------------------------------------------------
+// Status strip: how fresh the analysis is, and the last 4 order
+// sheet uploads. Both decide whether the answers can be trusted.
+// ------------------------------------------------------------
+async function loadAfternoonStatus(){
+  const el = document.getElementById('aftStatusArea');
+  if(!el) return;
+  el.innerHTML = `<p class="no-history">Checking data freshness...</p>`;
+  const wh = AFT.warehouseId;
+
+  const [snapRes, runsRes] = await Promise.all([
+    sb.from('medicine_analysis_snapshots').select('snapshot_date')
+      .eq('warehouse_id', wh).order('snapshot_date', { ascending:false })
+      .limit(1).maybeSingle(),
+    sb.from('order_runs').select('id, run_at')
+      .eq('warehouse_id', wh).order('run_at', { ascending:false }).limit(4),
+  ]);
+
+  AFT.snapshotDate = snapRes.data ? snapRes.data.snapshot_date : null;
+
+  const dayMs = 86400000;
+  const startOfDay = d => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
+  const today = startOfDay(new Date());
+
+  let snapHTML;
+  if(!AFT.snapshotDate){
+    snapHTML = `<span style="color:var(--red); font-weight:600;">No analysis uploaded yet for this warehouse</span>
+      <span style="color:var(--muted);"> — min &amp; max are unknown, nothing can be decided.</span>`;
+  } else {
+    const age = Math.round((today - startOfDay(AFT.snapshotDate + 'T00:00:00')) / dayMs);
+    const stale = age > 4;
+    snapHTML = `Analysis from <strong>${new Date(AFT.snapshotDate+'T00:00:00').toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})}</strong>
+      <span style="color:${stale?'var(--amber)':'var(--green)'}; font-weight:600;">
+        — ${age === 0 ? 'today' : age === 1 ? '1 day old' : age + ' days old'}${stale ? '. Run your Python and upload before relying on this.' : ''}
+      </span>`;
+  }
+
+  const runs = runsRes.data || [];
+  const fmtRun = r => {
+    const d = new Date(r.run_at);
+    const days = Math.round((today - startOfDay(d)) / dayMs);
+    const when = days === 0 ? 'Today' : days === 1 ? 'Yesterday' : `${days} days ago`;
+    return `<tr><td>${when}</td><td>${d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})}</td>
+            <td>${d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</td></tr>`;
+  };
+  const uploadedToday = runs.some(r => Math.round((today - startOfDay(new Date(r.run_at)))/dayMs) === 0);
+
+  el.innerHTML = `
+    <div class="item-row" style="margin-bottom:12px; border-color:${AFT.snapshotDate ? 'var(--teal)' : 'var(--red)'};">
+      <p class="no-history" style="font-style:normal; margin:0 0 6px;">${snapHTML}</p>
+      ${uploadedToday
+        ? `<p class="no-history" style="font-style:normal; color:var(--green); font-weight:600; margin:0;">Morning order sheet uploaded today.</p>`
+        : `<p class="no-history" style="font-style:normal; color:var(--amber); font-weight:600; margin:0;">No order sheet uploaded today — items ordered this morning will not be detected.</p>`}
+      ${runs.length ? `
+        <table class="summary" style="margin-top:8px;">
+          <tr><th>When</th><th>Date</th><th>Time</th></tr>
+          ${runs.map(fmtRun).join('')}
+        </table>
+        <p class="no-history" style="margin:6px 0 0; font-size:12px;">Last ${runs.length} order sheet upload(s).</p>`
+        : `<p class="no-history" style="margin:6px 0 0;">No order sheets uploaded yet.</p>`}
+    </div>`;
+}
+
+function downloadAfternoonSample(){
+  const rows = [
+    { 'Item Code':'M0004521', 'Item Name':'Aciloc 150 Tablet', 'Pack Size':'30 Tablet',
+      'Current Stock(Loose)':120, 'Closing (Strip)':4 },
+    { 'Item Code':'M0012004', 'Item Name':'Absolut 3G Softgel Capsule', 'Pack Size':'10 Capsules',
+      'Current Stock(Loose)':40, 'Closing (Strip)':4 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [{wch:14},{wch:32},{wch:16},{wch:20},{wch:16}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Stock List');
+  XLSX.writeFile(wb, 'afternoon_stock_list_format.xlsx');
+}
+
+// ------------------------------------------------------------
+// Read the file, decide each row.
+// ------------------------------------------------------------
+function handleAfternoonUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('aftResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Reading file...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    try {
+      const wb = file.name.toLowerCase().endsWith('.csv')
+        ? XLSX.read(evt.target.result, { type:'string' })
+        : XLSX.read(evt.target.result, { type:'array' });
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } catch(err){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Could not read the file: ${escapeHtml(err.message)}</p>`;
+      e.target.value=''; return;
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">The file appears to be empty.</p>`;
+      e.target.value=''; return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...kw) => cols.find(c => kw.every(k => c.toLowerCase().includes(k)));
+    const codeCol = find('item','code') || find('product','code') || cols.find(c=>/^\s*code\s*$/i.test(c));
+    const nameCol = [find('item','name'), find('medicine','name'), find('name')].find(c=>c && c!==codeCol);
+    const packCol = find('pack');
+    const stripCol = find('closing','strip') || find('strip') || find('stock');
+    if(!nameCol || !stripCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        Need a medicine name column and a stock-in-strip column.<br>Found: ${escapeHtml(cols.join(', '))}</p>`;
+      e.target.value=''; return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history">Looking up min &amp; max, and recent orders...</p>`;
+    const wh = AFT.warehouseId;
+
+    if(!AFT.snapshotDate){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        No analysis snapshot for this warehouse. Upload your Python output first — without it there is no min or max to compare against.</p>`;
+      e.target.value=''; return;
+    }
+
+    // items, analysis, recent orders, distributors
+    const sinceISO = new Date(Date.now() - AFT_LOOKBACK_DAYS*86400000).toISOString();
+    const [itemsData, analysis, recent, dists] = await Promise.all([
+      fetchAllRows('items', 'id, code, item_name, pack_size'),
+      fetchAllRows('medicine_analysis_snapshots',
+        'item_id, min_stock, max_stock, can_order, stock_logic, medicine_type, stock_warning, qty_30d, unique_cust_30d, bills_30d',
+        q => q.eq('warehouse_id', wh).eq('snapshot_date', AFT.snapshotDate)),
+      sb.from('order_run_items')
+        .select('item_id, qty, distributor_id, status, order_runs!inner(run_at, warehouse_id)')
+        .eq('order_runs.warehouse_id', wh)
+        .gte('order_runs.run_at', sinceISO),
+      sb.from('distributors').select('id, name').order('name'),
+    ]);
+
+    AFT.distributors = dists.data || [];
+
+    const byCode = {}, byName = {};
+    itemsData.forEach(i=>{
+      if(i.code) byCode[String(i.code).trim().toLowerCase()] = i;
+      const k = String(i.item_name).trim().toLowerCase();
+      (byName[k] = byName[k] || []).push(i);
+    });
+    const anaByItem = {};
+    analysis.forEach(a => { anaByItem[a.item_id] = a; });
+
+    const distName = {};
+    AFT.distributors.forEach(d => { distName[d.id] = d.name; });
+    const ordersByItem = {};
+    (recent.data || []).forEach(o=>{
+      if(o.status !== 'ordered') return;
+      (ordersByItem[o.item_id] = ordersByItem[o.item_id] || []).push({
+        at: new Date(o.order_runs.run_at),
+        qty: o.qty,
+        dist: distName[o.distributor_id] || 'Unknown distributor',
+      });
+    });
+    Object.values(ordersByItem).forEach(list => list.sort((a,b)=> b.at - a.at));
+
+    const num = v => { const n = parseFloat(v); return isFinite(n) ? n : null; };
+
+    AFT.rows = rows.map(r=>{
+      const rawName = String(r[nameCol] ?? '').trim();
+      const rawPack = packCol ? String(r[packCol] ?? '').trim() : '';
+      const stock = num(r[stripCol]);
+
+      // match on code first, then name+pack
+      let item = null;
+      const c = codeCol ? String(r[codeCol] ?? '').trim().toLowerCase() : '';
+      if(c && byCode[c]) item = byCode[c];
+      if(!item){
+        const cands = byName[rawName.toLowerCase()] || [];
+        if(cands.length === 1) item = cands[0];
+        else if(cands.length > 1 && rawPack)
+          item = cands.find(x => String(x.pack_size).trim().toLowerCase() === rawPack.toLowerCase()) || null;
+      }
+
+      const base = { name: rawName, pack: rawPack, stock, history: [] };
+      if(!item) return { ...base, kind:'MISS', todo:'NOT FOUND',
+        why:'No medicine matched this name and pack. Check spelling, or add an item code column.' };
+
+      const a = anaByItem[item.id];
+      base.name = item.item_name; base.pack = item.pack_size || rawPack;
+      base.itemId = item.id;
+      base.history = ordersByItem[item.id] || [];
+      if(a){
+        base.group = a.medicine_type; base.min = a.min_stock; base.max = a.max_stock;
+        base.sold30 = a.qty_30d; base.cust30 = a.unique_cust_30d; base.bills30 = a.bills_30d;
+      }
+
+      if(!a) return { ...base, kind:'MISS', todo:'NO ANALYSIS',
+        why:'This medicine is not in the latest analysis upload.' };
+
+      if(a.can_order === false)
+        return { ...base, kind:'BLOCK', todo:'DO NOT ORDER',
+                 why: a.stock_logic || 'Blocked in the analysis.' };
+
+      if(stock === null)
+        return { ...base, kind:'MISS', todo:'NO STOCK GIVEN',
+                 why:'Stock in strip was blank or not a number.' };
+
+      // already ordered / on the way wins over any order suggestion
+      if(base.history.length){
+        const h = base.history[0];
+        return { ...base, kind:'WAY', todo:'SKIP',
+          why:`${h.qty} already coming from ${h.dist}. Do not order again.`,
+          orderQty: (a.min_stock !== null && stock <= a.min_stock) ? Math.max(0, (a.max_stock||0) - stock) : 0 };
+      }
+
+      if(a.stock_warning && String(a.stock_warning).toUpperCase().includes('TOO MUCH'))
+        return { ...base, kind:'SKIP', todo:'SKIP', orderQty:0,
+                 why:'TOO MUCH STOCK flagged in the analysis. Do not add more.' };
+
+      if(a.min_stock === null || a.max_stock === null)
+        return { ...base, kind:'MISS', todo:'DECIDE BY HAND',
+                 why:'No min or max set for this medicine.' };
+
+      if(stock <= a.min_stock){
+        const q = Math.max(0, a.max_stock - stock);
+        return { ...base, kind:'ORDER', todo:`ORDER ${q}`, orderQty:q,
+                 why:`Stock ${stock} at or below min ${a.min_stock}. Top up to max ${a.max_stock}.` };
+      }
+      return { ...base, kind:'SKIP', todo:'SKIP', orderQty:0,
+               why:`Stock ${stock} above min ${a.min_stock}. Enough for now.` };
+    });
+
+    renderAfternoonResults();
+    e.target.value='';
+  };
+
+  if(file.name.toLowerCase().endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+function aftWhen(d){
+  const s = x => { const y = new Date(x); y.setHours(0,0,0,0); return y; };
+  const days = Math.round((s(new Date()) - s(d)) / 86400000);
+  const part = d.getHours() < 12 ? 'morning' : d.getHours() < 17 ? 'afternoon' : 'evening';
+  if(days === 0) return `this ${part}`;
+  if(days === 1) return `yesterday ${part}`;
+  return `${days} days ago`;
+}
+
+function renderAfternoonResults(){
+  const el = document.getElementById('aftResult');
+  const KIND = {
+    ORDER: ['var(--green)', 'Order now'],
+    WAY:   ['var(--amber)', 'Already ordered or on the way'],
+    SKIP:  ['var(--muted)', 'Enough stock'],
+    BLOCK: ['var(--red)',   'Blocked or decide by hand'],
+    MISS:  ['var(--muted)', 'Not matched'],
+  };
+  const counts = {};
+  AFT.rows.forEach(r => { counts[r.kind] = (counts[r.kind]||0)+1; });
+
+  const order = { ORDER:0, WAY:1, BLOCK:2, MISS:3, SKIP:4 };
+  const sorted = [...AFT.rows].sort((a,b)=> (order[a.kind]-order[b.kind]) || a.name.localeCompare(b.name));
+
+  el.innerHTML = `
+    <div class="item-row" style="margin-top:14px;">
+      <p class="no-history" style="font-style:normal; font-weight:600; color:var(--ink); margin:0 0 8px;">
+        ${AFT.rows.length} item(s) checked
+      </p>
+      <p class="no-history" style="font-style:normal; margin:0 0 10px;">
+        ${Object.entries(KIND).filter(([k])=>counts[k]).map(([k,[col,label]])=>
+          `<strong style="color:${col};">${label}: ${counts[k]}</strong>`).join(' &middot; ')}
+      </p>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-ghost" id="aftDownloadBtn">Download as Excel</button>
+      </div>
+      <div style="overflow-x:auto; margin-top:12px;">
+      <table class="summary">
+        <tr>
+          <th>Medicine</th><th>Pack</th><th>Group</th>
+          <th>Sold 30d</th><th>Cust 30d</th><th>Bills 30d</th>
+          <th>Stock</th><th>Min</th><th>Max</th>
+          <th>What to do</th><th>Why</th><th>Ordered in last ${AFT_LOOKBACK_DAYS} days</th><th></th>
+        </tr>
+        ${sorted.map((r,i)=>{
+          const col = KIND[r.kind][0];
+          const hist = r.history && r.history.length
+            ? r.history.map(h=>`${escapeHtml(h.dist)} &middot; ${aftWhen(h.at)} &middot; ${h.qty}`).join('<br>')
+            : `<span style="color:var(--muted);">Nothing in last ${AFT_LOOKBACK_DAYS} days.</span>`;
+          const canRecord = r.itemId && (r.kind==='ORDER' || r.kind==='SKIP');
+          return `<tr>
+            <td>${escapeHtml(r.name)}</td>
+            <td>${escapeHtml(r.pack||'')}</td>
+            <td>${escapeHtml(r.group||'-')}</td>
+            <td style="text-align:center;">${r.sold30 ?? '-'}</td>
+            <td style="text-align:center;">${r.cust30 ?? '-'}</td>
+            <td style="text-align:center;">${r.bills30 ?? '-'}</td>
+            <td style="text-align:center;">${r.stock ?? '-'}</td>
+            <td style="text-align:center;">${r.min ?? '-'}</td>
+            <td style="text-align:center;">${r.max ?? '-'}</td>
+            <td style="color:${col}; font-weight:600; white-space:nowrap;">${escapeHtml(r.todo)}</td>
+            <td style="color:var(--muted);">${escapeHtml(r.why)}</td>
+            <td style="font-size:12px;">${hist}</td>
+            <td>${canRecord ? `<button class="btn btn-ghost aft-rec" data-i="${i}" style="padding:4px 10px; font-size:12px;">Record</button>` : ''}</td>
+          </tr>
+          ${canRecord ? `<tr id="aftRec${i}" style="display:none;"><td colspan="13" style="background:var(--paper);">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:6px 0;">
+              <select id="aftDist${i}" style="max-width:280px;">
+                <option value="">Choose distributor...</option>
+                ${AFT.distributors.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('')}
+              </select>
+              <input type="number" id="aftQty${i}" value="${r.orderQty ?? 0}" min="1" style="width:80px;">
+              <button class="btn btn-primary aft-save" data-i="${i}" style="padding:6px 14px;">Save order</button>
+              <span id="aftMsg${i}" style="font-size:12px;"></span>
+            </div></td></tr>` : ''}`;
+        }).join('')}
+      </table>
+      </div>
+    </div>`;
+
+  document.getElementById('aftDownloadBtn').addEventListener('click', downloadAfternoonResults);
+  el.querySelectorAll('.aft-rec').forEach(b=> b.addEventListener('click', ()=>{
+    const row = document.getElementById('aftRec'+b.dataset.i);
+    row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+  }));
+  el.querySelectorAll('.aft-save').forEach(b=> b.addEventListener('click', ()=> saveAfternoonOrder(b.dataset.i)));
+}
+
+// ------------------------------------------------------------
+// Record an order placed now. Reuses today's order run if one
+// exists, so afternoon orders sit alongside the morning sheet.
+// ------------------------------------------------------------
+async function saveAfternoonOrder(i){
+  const r = AFT.rows[i];
+  const distId = document.getElementById('aftDist'+i).value;
+  const qty = parseInt(document.getElementById('aftQty'+i).value, 10);
+  const msg = document.getElementById('aftMsg'+i);
+  if(!distId){ msg.textContent = 'Choose a distributor first.'; msg.style.color='var(--red)'; return; }
+  if(!qty || qty < 1){ msg.textContent = 'Enter a quantity.'; msg.style.color='var(--red)'; return; }
+  msg.textContent = 'Saving...'; msg.style.color='var(--muted)';
+
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  let runId = null;
+  const { data: existing } = await sb.from('order_runs').select('id')
+    .eq('warehouse_id', AFT.warehouseId)
+    .gte('run_at', todayStart.toISOString())
+    .order('run_at', { ascending:false }).limit(1).maybeSingle();
+  if(existing) runId = existing.id;
+  else {
+    const { data: made, error } = await sb.from('order_runs')
+      .insert({ warehouse_id: AFT.warehouseId, run_at: new Date().toISOString() })
+      .select('id').single();
+    if(error){ msg.textContent = 'Could not save: '+error.message; msg.style.color='var(--red)'; return; }
+    runId = made.id;
+  }
+
+  const { error } = await sb.from('order_run_items').insert({
+    order_run_id: runId, item_id: r.itemId, qty,
+    distributor_id: distId, status: 'ordered', reason: null,
+  });
+  if(error){ msg.textContent = 'Could not save: '+error.message; msg.style.color='var(--red)'; return; }
+
+  const dist = AFT.distributors.find(d=>d.id===distId);
+  r.history.unshift({ at: new Date(), qty, dist: dist ? dist.name : 'Unknown' });
+  r.kind='WAY'; r.todo='SKIP';
+  r.why=`${qty} already coming from ${dist ? dist.name : 'distributor'}. Do not order again.`;
+  renderAfternoonResults();
+}
+
+function downloadAfternoonResults(){
+  if(!AFT.rows.length) return;
+  const order = { ORDER:0, WAY:1, BLOCK:2, MISS:3, SKIP:4 };
+  const out = [...AFT.rows]
+    .sort((a,b)=> (order[a.kind]-order[b.kind]) || a.name.localeCompare(b.name))
+    .map(r=>({
+      'Medicine Name': r.name,
+      'Pack Size': r.pack || '',
+      'Group': r.group || '-',
+      'Sold (30d)': r.sold30 ?? '',
+      'Customers (30d)': r.cust30 ?? '',
+      'Bills (30d)': r.bills30 ?? '',
+      'Stock': r.stock ?? '',
+      'Min': r.min ?? '',
+      'Max': r.max ?? '',
+      'Order Qty': r.orderQty ?? '',
+      'What To Do': r.todo,
+      'Why': r.why,
+      [`Ordered In Last ${AFT_LOOKBACK_DAYS} Days`]: (r.history && r.history.length)
+        ? r.history.map(h=>`${h.dist} - ${aftWhen(h.at)} - ${h.qty}`).join(' | ')
+        : 'Nothing in the last 3 days.',
+    }));
+  const ws = XLSX.utils.json_to_sheet(out);
+  ws['!cols'] = [{wch:30},{wch:14},{wch:16},{wch:11},{wch:14},{wch:11},{wch:8},{wch:7},{wch:7},{wch:10},{wch:16},{wch:44},{wch:46}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Afternoon Check');
+  XLSX.writeFile(wb, `afternoon_check_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
 function adminTabHTML(){
   return `
     <div class="grid-2">
