@@ -149,6 +149,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dis
 
 let state = {
   session: null,
+  role: 'team',            // 'admin' or 'team'. Set on login from user_roles.
   warehouses: [],
   currentWarehouse: null,
   activeTab: 'order',
@@ -159,6 +160,30 @@ let state = {
 };
 
 const app = document.getElementById('app');
+
+// ============================================================
+// ROLES
+//
+// 'admin' — everything
+// 'team'  — New Order, Afternoon Check, and Repeat Orders
+//           without the purchase data upload
+//
+// NOTE: this hides things in the browser. It stops mistakes,
+// not a determined person — anyone who opens the browser
+// console can still call the functions. Enforcing it properly
+// needs Row Level Security policies in Supabase.
+// ============================================================
+const TEAM_TABS = ['order', 'afternoon', 'repeats'];
+
+function isAdmin(){ return state.role === 'admin'; }
+
+async function loadUserRole(){
+  state.role = 'team';                     // default to the lower privilege
+  if(!state.session || !state.session.user) return;
+  const { data, error } = await sb.from('user_roles')
+    .select('role').eq('user_id', state.session.user.id).maybeSingle();
+  if(!error && data && data.role) state.role = data.role;
+}
 
 // ============================================================
 // RENDER ROOT
@@ -208,6 +233,7 @@ function renderLogin(errorMsg){
       return;
     }
     state.session = data.session;
+    await loadUserRole();
     await loadWarehouses();
     render();
   });
@@ -235,17 +261,18 @@ function renderMain(){
         <select id="warehouseSelect">
           ${state.warehouses.map(w => `<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${w.name}</option>`).join('')}
         </select>
-        <button class="logout" id="logoutBtn">Log out</button>
+        <span id="roleBadge" style="color:#fff; font-size:11px; font-weight:600; padding:3px 10px; border-radius:10px; margin-right:10px;"></span><button class="logout" id="logoutBtn">Log out</button>
       </div>
     </div>
     <div class="tabs">
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
       <button data-tab="afternoon" class="${state.activeTab==='afternoon'?'active':''}">Afternoon Check</button>
+      ${isAdmin() ? `
       <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
       <button data-tab="match" class="${state.activeTab==='match'?'active':''}">Match Items</button>
-      <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>
+      <button data-tab="admin" class="${state.activeTab==='admin'?'active':''}">Admin</button>` : ''}
     </div>
     <div class="wrap" id="tabContent"></div>
   `;
@@ -254,9 +281,15 @@ function renderMain(){
     state.suggestions = {}; state.parsedRows = []; state.chosen = {};
     renderTabContent();
   });
+  const roleBadge = document.getElementById('roleBadge');
+  if(roleBadge){
+    roleBadge.textContent = isAdmin() ? 'Admin' : 'Team';
+    roleBadge.style.background = isAdmin() ? 'var(--teal)' : 'var(--muted)';
+  }
   document.getElementById('logoutBtn').addEventListener('click', async ()=>{
     await sb.auth.signOut();
     state.session = null;
+    state.role = 'team';
     render();
   });
   document.querySelectorAll('.tabs button').forEach(b=>{
@@ -266,6 +299,9 @@ function renderMain(){
 }
 
 function renderTabContent(){
+  // a team member landing on an admin tab (old link, stale state)
+  // is sent back to New Order rather than shown a broken screen
+  if(!isAdmin() && !TEAM_TABS.includes(state.activeTab)) state.activeTab = 'order';
   const el = document.getElementById('tabContent');
   if(state.activeTab === 'order') el.innerHTML = orderTabHTML();
   else if(state.activeTab === 'repeats'){ el.innerHTML = repeatsTabHTML(); initRepeatsTab(); }
@@ -567,6 +603,7 @@ async function logOrderRun(rows){
 // ============================================================
 function repeatsTabHTML(){
   return `
+    ${!isAdmin() ? '' : `
     <div class="card">
       <h2>Upload purchase data</h2>
       <p class="hint">Logs what was <strong>actually received</strong> from distributors (not what was ordered) — keeps distributor suggestions, Repeat Orders, and Pharmarack's "Your History" columns accurate over time.</p>
@@ -587,7 +624,7 @@ function repeatsTabHTML(){
         <p class="hint" style="margin-bottom:8px;"><strong>Upload history — check this before uploading, to avoid re-uploading the same dates:</strong></p>
         <div id="purchaseUploadLogArea"></div>
       </div>
-    </div>
+    </div>`}
     <div class="card">
       <h2>Upload order sheet</h2>
       <p class="hint">For order sheets from your own export (item name, pack size, distributor ordered to, qty, last order date). Groups items by date into order runs — same repeat-order logic as orders placed live in the app.</p>
@@ -629,6 +666,7 @@ function initRepeatsTab(){
   const pdSampleBtn = document.getElementById('downloadSamplePurchaseDataBtn');
   if(pdSampleBtn) pdSampleBtn.addEventListener('click', downloadSamplePurchaseDataFormat);
   const pdWarehouseSelect = document.getElementById('purchaseDataWarehouseSelect');
+  if(!pdWarehouseSelect) return;   // team view — the card is not rendered
   if(pdWarehouseSelect) pdWarehouseSelect.addEventListener('change', loadPurchaseUploadLog);
   loadPurchaseUploadLog();
 
@@ -4049,6 +4087,7 @@ function escapeHtml(str){
   const { data } = await sb.auth.getSession();
   if(data.session){
     state.session = data.session;
+    await loadUserRole();
     await loadWarehouses();
   }
   render();
