@@ -150,6 +150,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dis
 let state = {
   session: null,
   role: 'team',            // 'admin' or 'team'. Set on login from user_roles.
+  userName: '',            // display name from user_roles.note, else the email
   warehouses: [],
   currentWarehouse: null,
   activeTab: 'order',
@@ -179,10 +180,16 @@ function isAdmin(){ return state.role === 'admin'; }
 
 async function loadUserRole(){
   state.role = 'team';                     // default to the lower privilege
+  state.userName = '';
   if(!state.session || !state.session.user) return;
+  // fall back to the part of the email before the @ if no note is set
+  state.userName = String(state.session.user.email || '').split('@')[0];
   const { data, error } = await sb.from('user_roles')
-    .select('role').eq('user_id', state.session.user.id).maybeSingle();
-  if(!error && data && data.role) state.role = data.role;
+    .select('role, note').eq('user_id', state.session.user.id).maybeSingle();
+  if(!error && data){
+    if(data.role) state.role = data.role;
+    if(data.note && data.note.trim()) state.userName = data.note.trim();
+  }
 }
 
 // ============================================================
@@ -283,8 +290,9 @@ function renderMain(){
   });
   const roleBadge = document.getElementById('roleBadge');
   if(roleBadge){
-    roleBadge.textContent = isAdmin() ? 'Admin' : 'Team';
+    roleBadge.textContent = `${state.userName || 'User'} · ${isAdmin() ? 'Admin' : 'Team'}`;
     roleBadge.style.background = isAdmin() ? 'var(--teal)' : 'var(--muted)';
+    roleBadge.title = state.session?.user?.email || '';
   }
   document.getElementById('logoutBtn').addEventListener('click', async ()=>{
     await sb.auth.signOut();
