@@ -174,7 +174,7 @@ const app = document.getElementById('app');
 // console can still call the functions. Enforcing it properly
 // needs Row Level Security policies in Supabase.
 // ============================================================
-const TEAM_TABS = ['order', 'afternoon', 'repeats'];
+const TEAM_TABS = ['order', 'afternoon', 'repeats', 'returns', 'purchasecheck'];
 
 function isAdmin(){ return state.role === 'admin'; }
 
@@ -275,8 +275,8 @@ function renderMain(){
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
       <button data-tab="afternoon" class="${state.activeTab==='afternoon'?'active':''}">Afternoon Check</button>
-      ${isAdmin() ? `<button data-tab="returns" class="${state.activeTab==='returns'?'active':''}">Returns</button>
-      <button data-tab="purchasecheck" class="${state.activeTab==='purchasecheck'?'active':''}">Purchase Check</button>` : ''}
+      <button data-tab="returns" class="${state.activeTab==='returns'?'active':''}">Returns</button>
+      <button data-tab="purchasecheck" class="${state.activeTab==='purchasecheck'?'active':''}">Purchase Check</button>
       ${isAdmin() ? `
       <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
