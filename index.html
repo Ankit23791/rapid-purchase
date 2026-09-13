@@ -275,6 +275,7 @@ function renderMain(){
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
       <button data-tab="afternoon" class="${state.activeTab==='afternoon'?'active':''}">Afternoon Check</button>
+      ${isAdmin() ? `<button data-tab="returns" class="${state.activeTab==='returns'?'active':''}">Returns</button>` : ''}
       ${isAdmin() ? `
       <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
@@ -316,6 +317,7 @@ function renderTabContent(){
   else if(state.activeTab === 'inventory'){ el.innerHTML = inventoryTabHTML(); loadInventoryAnalysis(); }
   else if(state.activeTab === 'refill'){ el.innerHTML = refillTabHTML(); initRefillTab(); }
   else if(state.activeTab === 'afternoon'){ el.innerHTML = afternoonTabHTML(); initAfternoonTab(); }
+  else if(state.activeTab === 'returns'){ el.innerHTML = returnsTabHTML(); initReturnsTab(); }
   else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
   else el.innerHTML = adminTabHTML();
   attachTabHandlers();
@@ -3296,6 +3298,527 @@ function downloadAfternoonResults(){
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Afternoon Check');
   XLSX.writeFile(wb, `afternoon_check_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+// ============================================================
+// RETURNS
+//
+// Stock sitting on the shelf that is not selling can go back to
+// the distributor who supplied it — but only within their return
+// window, which runs from the PURCHASE date, not the expiry.
+//
+// The batch number is what links a shelf item to its purchase,
+// and therefore to a distributor and a deadline.
+//
+// The window almost always closes long before the stock gets
+// near expiry. That is the whole difficulty: the decision has to
+// be made months early, on a forecast of what will sell.
+// ============================================================
+
+const RET = {
+  rows: [],
+  byDistributor: {},
+  warehouseId: null,
+  snapshotDate: null,
+  totals: { value: 0, batches: 0 },
+};
+
+// Customers avoid short-dated stock, so the last 3 months before
+// expiry are treated as unsellable.
+const RET_DEAD_MONTHS = 3;
+// Below this, an item is not worth deciding one at a time —
+// it gets grouped by distributor instead.
+const RET_SMALL_VALUE = 500;
+
+function returnsTabHTML(){
+  return `
+    <div class="card">
+      <h2>Returns</h2>
+      <p class="hint">Upload the batch-wise stock sheet. The app matches each batch to the
+      purchase that supplied it, works out how much is worth keeping, and lists the rest by
+      distributor — with the date each return window closes.</p>
+      <label>Warehouse</label>
+      <select id="retWarehouseSelect" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div id="retStatusArea"></div>
+      <div class="btn-row" style="margin-top:0;">
+        <label class="btn btn-primary" style="position:relative;">
+          Upload stock sheet
+          <input type="file" id="retInput" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;">
+        </label>
+        <button class="btn btn-ghost" id="retSampleBtn">Download sample format</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0;">Expected columns:
+        <span class="mono">Item Name</span>, <span class="mono">Unit</span>,
+        <span class="mono">Batch</span>, <span class="mono">Expiry</span>,
+        <span class="mono">Stock</span>. Optional but useful:
+        <span class="mono">Stock by LP</span> (landing price — what you get back),
+        <span class="mono">Location</span>. Extra columns are ignored.</p>
+      <div id="retResult"></div>
+    </div>`;
+}
+
+async function initReturnsTab(){
+  const sel = document.getElementById('retWarehouseSelect');
+  RET.warehouseId = sel.value;
+  sel.addEventListener('change', ()=>{
+    RET.warehouseId = sel.value;
+    RET.rows = [];
+    document.getElementById('retResult').innerHTML = '';
+    loadReturnsStatus();
+  });
+  document.getElementById('retInput').addEventListener('change', handleReturnsUpload);
+  document.getElementById('retSampleBtn').addEventListener('click', downloadReturnsSample);
+  loadReturnsStatus();
+}
+
+async function loadReturnsStatus(){
+  const el = document.getElementById('retStatusArea');
+  if(!el) return;
+  el.innerHTML = `<p class="no-history">Checking data...</p>`;
+  const wh = RET.warehouseId;
+
+  const [snapRes, batchRes, noReturnRes] = await Promise.all([
+    sb.from('medicine_analysis_snapshots').select('snapshot_date')
+      .eq('warehouse_id', wh).order('snapshot_date', { ascending:false })
+      .limit(1).maybeSingle(),
+    sb.from('purchase_history').select('id', { count:'exact', head:true })
+      .eq('warehouse_id', wh).not('batch','is',null)
+      .gte('purchase_date', new Date(Date.now() - 150*86400000).toISOString().slice(0,10)),
+    sb.from('distributors').select('name').eq('accepts_returns', false),
+  ]);
+
+  RET.snapshotDate = snapRes.data ? snapRes.data.snapshot_date : null;
+  const batched = batchRes.count || 0;
+  const noReturn = (noReturnRes.data || []).map(d => d.name);
+
+  el.innerHTML = `
+    <div class="item-row" style="margin-bottom:12px; border-color:${batched ? 'var(--teal)' : 'var(--red)'};">
+      <p class="no-history" style="font-style:normal; margin:0 0 4px;">
+        ${batched
+          ? `<strong>${batched.toLocaleString()}</strong> purchase rows with batch numbers in the last 150 days.`
+          : `<span style="color:var(--red); font-weight:600;">No purchase rows with batch numbers.</span>
+             <span style="color:var(--muted);">Re-upload purchases with a Batch column first — without it there is no way to know which distributor supplied the stock.</span>`}
+      </p>
+      <p class="no-history" style="font-style:normal; margin:0;">
+        ${RET.snapshotDate
+          ? `Analysis from ${new Date(RET.snapshotDate+'T00:00:00').toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})}`
+          : `<span style="color:var(--amber);">No analysis uploaded — keep quantities cannot be worked out.</span>`}
+      </p>
+      ${noReturn.length ? `<p class="no-history" style="font-style:normal; margin:6px 0 0; font-size:12px;">
+        Excluded (no return facility): ${escapeHtml(noReturn.join(', '))}</p>` : ''}
+    </div>`;
+}
+
+function downloadReturnsSample(){
+  const rows = [
+    { 'Item Name':'8X Shampoo', 'Unit':'120 Ml', 'Batch':'L25M6142', 'Expiry':'11/27',
+      'Stock':2, 'Location':'E-6', 'Stock by MRP':1011.7, 'Stock by LP':728.43 },
+    { 'Item Name':'A To Z Cv Capsule', 'Unit':'10 Capsules', 'Batch':'25500689', 'Expiry':'05/27',
+      'Stock':10, 'Location':'J-5-4-3', 'Stock by MRP':249.15, 'Stock by LP':185.37 },
+  ];
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [{wch:32},{wch:14},{wch:14},{wch:10},{wch:8},{wch:12},{wch:14},{wch:14}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Stock');
+  XLSX.writeFile(wb, 'returns_stock_format.xlsx');
+}
+
+// Expiry is a month on a pharma pack. Last day of that month is
+// when it actually stops being sellable.
+function retParseExpiry(v){
+  if(v === null || v === undefined || String(v).trim() === '') return null;
+  const eom = (y, m) => {
+    if(m < 1 || m > 12 || y < 2000 || y > 2100) return null;
+    return new Date(y, m, 0);
+  };
+  if(v instanceof Date && !isNaN(v)) return v;
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})[\/\-.](\d{2,4})$/);
+  if(m){ let y = parseInt(m[2],10); if(y<100) y += 2000; return eom(y, parseInt(m[1],10)); }
+  m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+  if(m){ let y = parseInt(m[3],10); if(y<100) y += 2000; return eom(y, parseInt(m[2],10)); }
+  m = s.match(/^(\d{4})[\/\-.](\d{1,2})$/);
+  if(m) return eom(parseInt(m[1],10), parseInt(m[2],10));
+  return null;
+}
+
+const retDays = (a, b) => Math.round((a - b) / 86400000);
+const retMonths = (a, b) => retDays(a, b) / 30.44;
+const retMoney = n => '\u20b9' + Math.round(Number(n)||0).toLocaleString('en-IN');
+const retDate = d => d ? d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'}) : '-';
+
+function handleReturnsUpload(e){
+  const file = e.target.files[0];
+  const resultEl = document.getElementById('retResult');
+  if(!file) return;
+  resultEl.innerHTML = `<p class="no-history">Reading file...</p>`;
+
+  const reader = new FileReader();
+  reader.onload = async (evt)=>{
+    let rows;
+    try {
+      const wb = file.name.toLowerCase().endsWith('.csv')
+        ? XLSX.read(evt.target.result, { type:'string' })
+        : XLSX.read(evt.target.result, { type:'array' });
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+    } catch(err){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">Could not read the file: ${escapeHtml(err.message)}</p>`;
+      e.target.value=''; return;
+    }
+    if(!rows.length){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">The file appears to be empty.</p>`;
+      e.target.value=''; return;
+    }
+
+    const cols = Object.keys(rows[0]);
+    const find = (...kw) => cols.find(c => kw.every(k => c.toLowerCase().includes(k)));
+    const exact = re => cols.find(c => re.test(c.trim()));
+    const codeCol  = find('item','code') || exact(/^code$/i);
+    const nameCol  = [find('item','name'), find('medicine','name'), find('name')].find(c=>c && c!==codeCol);
+    const packCol  = exact(/^unit$/i) || find('pack');
+    const batchCol = find('batch');
+    const expCol   = find('expiry') || find('exp');
+    // "Stock by MRP" and "Stock by LP" also contain "stock" — take the bare one
+    const stockCol = exact(/^stock$/i) || exact(/^qty$/i) || find('stock');
+    const lpCol    = find('stock','lp') || find('landing');
+    const locCol   = find('location') || find('rack');
+
+    if(!nameCol || !batchCol || !stockCol){
+      resultEl.innerHTML = `<p class="no-history" style="color:var(--red);">
+        Need medicine name, batch and stock columns.<br>Found: ${escapeHtml(cols.join(', '))}</p>`;
+      e.target.value=''; return;
+    }
+
+    resultEl.innerHTML = `<p class="no-history">Matching batches to purchases...</p>`;
+    const wh = RET.warehouseId;
+    const since = new Date(Date.now() - 200*86400000).toISOString().slice(0,10);
+
+    const [itemsData, purch, analysis, dists] = await Promise.all([
+      fetchAllRows('items', 'id, code, item_name, pack_size'),
+      fetchAllRows('purchase_history',
+        'item_id, distributor_id, purchase_date, batch, total_quantity',
+        q => q.eq('warehouse_id', wh).not('batch','is',null).gte('purchase_date', since)),
+      RET.snapshotDate
+        ? fetchAllRows('medicine_analysis_snapshots',
+            'item_id, min_stock, max_stock, medicine_type, qty_30d, qty_90d, can_order, trend, strips_per_day',
+            q => q.eq('warehouse_id', wh).eq('snapshot_date', RET.snapshotDate))
+        : Promise.resolve([]),
+      sb.from('distributors').select('id, name, accepts_returns, return_window_days'),
+    ]);
+
+    const byCode = {}, byName = {};
+    itemsData.forEach(i=>{
+      if(i.code) byCode[String(i.code).trim().toLowerCase()] = i;
+      const k = String(i.item_name).trim().toLowerCase();
+      (byName[k] = byName[k] || []).push(i);
+    });
+
+    // batch -> the purchase that supplied it. If the same batch was
+    // bought more than once, the most recent is the one still likely
+    // on the shelf, and it gives the longer window.
+    const byBatch = {};
+    purch.forEach(p=>{
+      const k = p.item_id + '|' + String(p.batch).trim().toLowerCase();
+      if(!byBatch[k] || p.purchase_date > byBatch[k].purchase_date) byBatch[k] = p;
+    });
+
+    const ana = {};
+    analysis.forEach(a => { ana[a.item_id] = a; });
+
+    const dmap = {};
+    (dists.data || []).forEach(d => { dmap[d.id] = d; });
+
+    const today = new Date(); today.setHours(0,0,0,0);
+    const num = v => { const n = parseFloat(v); return isFinite(n) ? n : null; };
+
+    // ---- pass 1: one entry per batch -----------------------
+    const parsed = rows.map(r=>{
+      const rawName = String(r[nameCol] ?? '').trim();
+      const rawPack = packCol ? String(r[packCol] ?? '').trim() : '';
+      const batch   = String(r[batchCol] ?? '').trim();
+      const stock   = num(r[stockCol]) || 0;
+      const expiry  = expCol ? retParseExpiry(r[expCol]) : null;
+      const lpTotal = lpCol ? (num(r[lpCol]) || 0) : 0;
+
+      let item = null;
+      const c = codeCol ? String(r[codeCol] ?? '').trim().toLowerCase() : '';
+      if(c && byCode[c]) item = byCode[c];
+      if(!item){
+        const cands = byName[rawName.toLowerCase()] || [];
+        if(cands.length === 1) item = cands[0];
+        else if(cands.length > 1 && rawPack)
+          item = cands.find(x => String(x.pack_size).trim().toLowerCase() === rawPack.toLowerCase()) || null;
+      }
+
+      const out = {
+        name: item ? item.item_name : rawName,
+        pack: item ? (item.pack_size || rawPack) : rawPack,
+        itemId: item ? item.id : null,
+        batch, stock, expiry,
+        lpPerUnit: stock > 0 ? lpTotal / stock : 0,
+        location: locCol ? String(r[locCol] ?? '').trim() : '',
+      };
+
+      if(!item){ out.block = 'Not matched to any medicine'; return out; }
+      if(stock <= 0){ out.block = 'No stock'; return out; }
+      if(!batch){ out.block = 'No batch number'; return out; }
+
+      const p = byBatch[item.id + '|' + batch.toLowerCase()];
+      if(!p){ out.block = 'Batch not found in purchases — cannot tell which distributor supplied it'; return out; }
+
+      const d = dmap[p.distributor_id];
+      out.distributorId = p.distributor_id;
+      out.distributor = d ? d.name : 'Unknown';
+      out.purchaseDate = new Date(p.purchase_date + 'T00:00:00');
+      const windowDays = d ? (d.return_window_days || 90) : 90;
+      out.windowCloses = new Date(out.purchaseDate.getTime() + windowDays*86400000);
+      out.daysLeft = retDays(out.windowCloses, today);
+
+      if(d && d.accepts_returns === false){ out.block = `${d.name} does not take returns`; return out; }
+      if(out.daysLeft < 0){ out.block = `Return window closed ${-out.daysLeft} days ago`; return out; }
+
+      out.ana = ana[item.id] || null;
+      return out;
+    });
+
+    // ---- pass 2: keep quantity is per ITEM, not per batch ---
+    // Work out how many to keep for the medicine as a whole, then
+    // allocate them to the longest-dated batches — the short-dated
+    // stock is what should go back.
+    const byItem = {};
+    parsed.forEach(p => {
+      if(!p.itemId || p.block) return;
+      (byItem[p.itemId] = byItem[p.itemId] || []).push(p);
+    });
+
+    Object.values(byItem).forEach(batches => {
+      const a = batches[0].ana;
+      const totalStock = batches.reduce((s,b)=> s + b.stock, 0);
+
+      // longest expiry first — those are the ones worth keeping
+      batches.sort((x,y)=> (y.expiry?.getTime() || 0) - (x.expiry?.getTime() || 0));
+
+      let keepLeft;
+      let reason;
+      if(!a){
+        keepLeft = totalStock;
+        reason = 'No analysis for this medicine — decide by hand';
+        batches.forEach(b => { b.block = reason; });
+        return;
+      }
+
+      const monthly = (a.qty_30d !== null && a.qty_30d !== undefined)
+        ? Number(a.qty_30d)
+        : (a.strips_per_day ? Number(a.strips_per_day) * 30 : 0);
+
+      // sellable life stops 3 months before expiry — nobody wants
+      // short-dated stock
+      const nearest = batches.reduce((m,b)=> (b.expiry && (!m || b.expiry < m)) ? b.expiry : m, null);
+      const sellableMonths = nearest ? Math.max(0, retMonths(nearest, new Date()) - RET_DEAD_MONTHS) : 12;
+      const expectedSales = monthly * sellableMonths;
+
+      let keep;
+      if(monthly <= 0){
+        keep = 0;
+        reason = 'Not sold in the last 30 days';
+      } else if(expectedSales < 1){
+        keep = 1;
+        reason = `Only ${expectedSales.toFixed(1)} expected to sell before it goes short-dated`;
+      } else {
+        keep = Math.min(Number(a.max_stock) || Math.ceil(expectedSales), Math.ceil(expectedSales));
+        reason = `Expect to sell ${expectedSales.toFixed(1)} in ${sellableMonths.toFixed(1)} sellable months`;
+      }
+      if(a.can_order === false && monthly <= 0){ keep = 0; reason = 'Blocked in the analysis and not selling'; }
+
+      keepLeft = keep;
+      batches.forEach(b=>{
+        const k = Math.min(keepLeft, b.stock);
+        keepLeft -= k;
+        b.keepQty = k;
+        b.returnQty = b.stock - k;
+        b.suggestedKeep = k;
+        b.value = b.returnQty * b.lpPerUnit;
+        b.reason = reason;
+        b.group = a.medicine_type;
+        b.monthly = monthly;
+        b.totalStock = totalStock;
+        b.itemKeep = keep;
+        if(b.returnQty <= 0) b.block = 'Worth keeping';
+      });
+    });
+
+    RET.rows = parsed;
+    renderReturnsResults();
+    e.target.value='';
+  };
+
+  if(file.name.toLowerCase().endsWith('.csv')) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+function renderReturnsResults(){
+  const el = document.getElementById('retResult');
+  const returnable = RET.rows.filter(r => !r.block && r.returnQty > 0);
+  const blocked = RET.rows.filter(r => r.block);
+
+  const totalValue = returnable.reduce((s,r)=> s + r.value, 0);
+  const urgent7  = returnable.filter(r => r.daysLeft <= 7);
+  const urgent30 = returnable.filter(r => r.daysLeft <= 30);
+
+  // group by distributor, biggest value first
+  const groups = {};
+  returnable.forEach(r=>{
+    const k = r.distributorId;
+    if(!groups[k]) groups[k] = { name: r.distributor, rows: [], value: 0, soonest: 9999 };
+    groups[k].rows.push(r);
+    groups[k].value += r.value;
+    groups[k].soonest = Math.min(groups[k].soonest, r.daysLeft);
+  });
+  RET.byDistributor = groups;
+  const ordered = Object.entries(groups).sort((a,b)=> b[1].value - a[1].value);
+
+  const blockReasons = {};
+  blocked.forEach(r => { blockReasons[r.block] = (blockReasons[r.block]||0)+1; });
+
+  el.innerHTML = `
+    <div class="item-row" style="margin-top:14px;">
+      <p class="no-history" style="font-style:normal; font-weight:600; font-size:16px; color:var(--ink); margin:0 0 6px;">
+        ${returnable.length} batch(es) worth returning &middot; ${retMoney(totalValue)} recoverable
+      </p>
+      <p class="no-history" style="font-style:normal; margin:0 0 10px;">
+        ${urgent7.length ? `<strong style="color:var(--red);">Window closes within 7 days: ${urgent7.length} (${retMoney(urgent7.reduce((s,r)=>s+r.value,0))})</strong> &middot; ` : ''}
+        ${urgent30.length ? `<strong style="color:var(--amber);">Within 30 days: ${urgent30.length} (${retMoney(urgent30.reduce((s,r)=>s+r.value,0))})</strong>` : ''}
+      </p>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-ghost" id="retDownloadBtn">Download as Excel</button>
+      </div>
+
+      ${ordered.map(([id, g], gi)=>{
+        const small = g.rows.filter(r => r.value < RET_SMALL_VALUE);
+        const big = g.rows.filter(r => r.value >= RET_SMALL_VALUE);
+        const show = [...big.sort((a,b)=> a.daysLeft - b.daysLeft || b.value - a.value),
+                      ...small.sort((a,b)=> a.daysLeft - b.daysLeft)];
+        return `
+        <div style="margin-top:18px; border-top:2px solid var(--teal); padding-top:12px;">
+          <p class="no-history" style="font-style:normal; font-weight:600; color:var(--ink); margin:0 0 2px;">
+            ${escapeHtml(g.name)} &mdash; ${retMoney(g.value)} &middot; ${g.rows.length} batch(es)
+          </p>
+          <p class="no-history" style="margin:0 0 8px; font-size:12px; color:${g.soonest<=7?'var(--red)':g.soonest<=30?'var(--amber)':'var(--muted)'};">
+            Earliest window closes in ${g.soonest} day(s)
+            ${small.length ? ` &middot; ${small.length} item(s) under ${retMoney(RET_SMALL_VALUE)} worth ${retMoney(small.reduce((s,r)=>s+r.value,0))} — send as one lot` : ''}
+          </p>
+          <div style="overflow-x:auto;">
+          <table class="summary">
+            <tr><th>Medicine</th><th>Batch</th><th>Expiry</th><th>Group</th>
+                <th>Stock</th><th>Keep</th><th>Return</th><th>Value</th>
+                <th>Window closes</th><th>Why</th></tr>
+            ${show.map(r=>`
+              <tr>
+                <td>${escapeHtml(r.name)}<div style="color:var(--muted); font-size:11px;">${escapeHtml(r.pack||'')}${r.location?' · '+escapeHtml(r.location):''}</div></td>
+                <td class="mono" style="font-size:11px;">${escapeHtml(r.batch)}</td>
+                <td style="white-space:nowrap;">${retDate(r.expiry)}</td>
+                <td style="font-size:11px;">${escapeHtml(r.group||'-')}</td>
+                <td style="text-align:center;">${r.stock}</td>
+                <td style="text-align:center;">${r.keepQty}</td>
+                <td style="text-align:center; font-weight:600;">${r.returnQty}</td>
+                <td style="text-align:right; font-weight:600;">${retMoney(r.value)}</td>
+                <td style="white-space:nowrap; color:${r.daysLeft<=7?'var(--red)':r.daysLeft<=30?'var(--amber)':'var(--muted)'};">
+                  ${retDate(r.windowCloses)}<div style="font-size:11px;">${r.daysLeft} days</div></td>
+                <td style="color:var(--muted); font-size:11px;">${escapeHtml(r.reason||'')}</td>
+              </tr>`).join('')}
+          </table>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary ret-save" data-d="${id}" style="padding:6px 14px;">
+              Save return list for ${escapeHtml(g.name)}
+            </button>
+            <span id="retMsg${gi}" style="font-size:12px;"></span>
+          </div>
+        </div>`;
+      }).join('')}
+
+      ${blocked.length ? `
+        <div style="margin-top:20px; border-top:1px solid var(--border); padding-top:12px;">
+          <p class="no-history" style="font-style:normal; font-weight:600; margin:0 0 6px;">
+            ${blocked.length} batch(es) not returnable
+          </p>
+          <table class="summary">
+            <tr><th>Reason</th><th>Batches</th></tr>
+            ${Object.entries(blockReasons).sort((a,b)=>b[1]-a[1])
+              .map(([why,n])=>`<tr><td>${escapeHtml(why)}</td><td style="text-align:center;">${n}</td></tr>`).join('')}
+          </table>
+        </div>` : ''}
+    </div>`;
+
+  document.getElementById('retDownloadBtn').addEventListener('click', downloadReturnsExcel);
+  el.querySelectorAll('.ret-save').forEach((b,i)=>
+    b.addEventListener('click', ()=> saveReturnList(b.dataset.d, i)));
+}
+
+async function saveReturnList(distId, gi){
+  const g = RET.byDistributor[distId];
+  if(!g) return;
+  const msg = document.getElementById('retMsg'+gi);
+  msg.textContent = 'Saving...'; msg.style.color = 'var(--muted)';
+
+  const { data: { user } } = await sb.auth.getUser();
+  const { data: run, error: runErr } = await sb.from('return_runs').insert({
+    warehouse_id: RET.warehouseId, distributor_id: distId,
+    created_by: user ? user.id : null, status: 'draft',
+  }).select('id').single();
+  if(runErr){ msg.textContent = 'Could not save: '+runErr.message; msg.style.color='var(--red)'; return; }
+
+  const payload = g.rows.map(r=>({
+    return_run_id: run.id, item_id: r.itemId, batch: r.batch,
+    expiry: r.expiry ? `${r.expiry.getFullYear()}-${String(r.expiry.getMonth()+1).padStart(2,'0')}-${String(r.expiry.getDate()).padStart(2,'0')}` : null,
+    stock_qty: r.stock, keep_qty: r.keepQty, return_qty: r.returnQty,
+    suggested_keep: r.suggestedKeep, landing_price: Math.round(r.value*100)/100,
+    reason: r.reason,
+    purchase_date: r.purchaseDate ? r.purchaseDate.toISOString().slice(0,10) : null,
+    window_closes: r.windowCloses ? r.windowCloses.toISOString().slice(0,10) : null,
+  }));
+
+  let saved = 0, lastErr = null;
+  for(let i=0;i<payload.length;i+=400){
+    const { error } = await sb.from('return_run_items').insert(payload.slice(i,i+400));
+    if(!error) saved += Math.min(400, payload.length-i); else lastErr = error;
+  }
+  msg.textContent = lastErr
+    ? `Saved ${saved} of ${payload.length} — ${lastErr.message}`
+    : `Saved — ${payload.length} batch(es), ${retMoney(g.value)}`;
+  msg.style.color = lastErr ? 'var(--red)' : 'var(--green)';
+}
+
+function downloadReturnsExcel(){
+  const returnable = RET.rows.filter(r => !r.block && r.returnQty > 0)
+    .sort((a,b)=> a.distributor.localeCompare(b.distributor) || a.daysLeft - b.daysLeft);
+  if(!returnable.length) return;
+  const out = returnable.map(r=>({
+    'Distributor': r.distributor,
+    'Medicine Name': r.name,
+    'Pack': r.pack || '',
+    'Batch': r.batch,
+    'Expiry': retDate(r.expiry),
+    'Location': r.location || '',
+    'Group': r.group || '',
+    'Sold (30d)': r.monthly ?? '',
+    'Stock': r.stock,
+    'Keep': r.keepQty,
+    'Return Qty': r.returnQty,
+    'Value (LP)': Math.round(r.value*100)/100,
+    'Purchased': retDate(r.purchaseDate),
+    'Window Closes': retDate(r.windowCloses),
+    'Days Left': r.daysLeft,
+    'Why': r.reason || '',
+  }));
+  const ws = XLSX.utils.json_to_sheet(out);
+  ws['!cols'] = [{wch:34},{wch:32},{wch:14},{wch:14},{wch:10},{wch:10},{wch:16},
+                 {wch:10},{wch:8},{wch:7},{wch:11},{wch:12},{wch:12},{wch:14},{wch:10},{wch:44}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Returns');
+  XLSX.writeFile(wb, `returns_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
 function adminTabHTML(){
