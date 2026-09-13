@@ -3450,6 +3450,18 @@ function retParseExpiry(v){
     return eom(d.getUTCFullYear(), d.getUTCMonth() + 1);
   }
   const s = String(v).trim();
+  // month name forms: "Mar-28", "MAR/2028", "03-Mar-28"
+  const MON = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  let mn = s.match(/^([A-Za-z]{3,})[\s\/\-.]+(\d{2,4})$/);
+  if(mn){
+    const mi = MON.indexOf(mn[1].slice(0,3).toLowerCase());
+    if(mi >= 0){ let y = parseInt(mn[2],10); if(y<100) y += 2000; return eom(y, mi+1); }
+  }
+  mn = s.match(/^(\d{1,2})[\s\/\-.]+([A-Za-z]{3,})[\s\/\-.]+(\d{2,4})$/);
+  if(mn){
+    const mi = MON.indexOf(mn[2].slice(0,3).toLowerCase());
+    if(mi >= 0){ let y = parseInt(mn[3],10); if(y<100) y += 2000; return eom(y, mi+1); }
+  }
   let m = s.match(/^(\d{1,2})[\/\-.](\d{2,4})$/);
   if(m){ let y = parseInt(m[2],10); if(y<100) y += 2000; return eom(y, parseInt(m[1],10)); }
   m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
@@ -3678,6 +3690,22 @@ function handleReturnsUpload(e){
       });
     });
 
+    // If an expiry column was found but nothing in it could be read,
+    // say so and show the raw value — a silently blank expiry makes
+    // every item fall back to a default shelf life, which quietly
+    // changes every keep quantity.
+    const expParsed = parsed.filter(p => p.expiry).length;
+    RET.expiryWarning = null;
+    if(!expCol){
+      RET.expiryWarning = 'No Expiry column found in the file. Shelf life is being guessed at 12 months for every item.';
+    } else if(expParsed === 0 && rows.length){
+      const samples = rows.slice(0,3).map(r=>{
+        const v = r[expCol];
+        return `${JSON.stringify(v)} (${typeof v})`;
+      }).join(', ');
+      RET.expiryWarning = `Found the column "${expCol}" but could not read any value in it. First few: ${samples}`;
+    }
+
     RET.rows = parsed;
     renderReturnsResults();
     e.target.value='';
@@ -3712,6 +3740,10 @@ function renderReturnsResults(){
   blocked.forEach(r => { blockReasons[r.block] = (blockReasons[r.block]||0)+1; });
 
   el.innerHTML = `
+    ${RET.expiryWarning ? `<div class="item-row" style="margin-top:14px; border-color:var(--amber);">
+      <p class="no-history" style="font-style:normal; color:var(--amber); font-weight:600; margin:0;">
+        Expiry problem: ${escapeHtml(RET.expiryWarning)}
+      </p></div>` : ''}
     <div class="item-row" style="margin-top:14px;">
       <p class="no-history" style="font-style:normal; font-weight:600; font-size:16px; color:var(--ink); margin:0 0 6px;">
         ${returnable.length} batch(es) worth returning &middot; ${retMoney(totalValue)} recoverable
