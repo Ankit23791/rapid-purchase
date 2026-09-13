@@ -1338,8 +1338,28 @@ async function handlePurchaseDataUpload(e){
     }
 
     let inserted = 0, lastError = null;
+    const started = Date.now();
     for(let i=0; i<toInsert.length; i+=500){
       const chunk = toInsert.slice(i, i+500);
+      // show progress — a long upload used to look identical to a stuck one
+      const done = Math.min(i + 500, toInsert.length);
+      const pct = Math.round(done / toInsert.length * 100);
+      const secs = Math.round((Date.now() - started) / 1000);
+      const left = i > 0
+        ? Math.round((Date.now() - started) / i * (toInsert.length - i) / 1000)
+        : null;
+      resultEl.innerHTML = `
+        <p class="no-history" style="font-style:normal; font-weight:600;">
+          Saving ${done.toLocaleString()} of ${toInsert.length.toLocaleString()} rows (${pct}%)
+        </p>
+        <div style="background:var(--border); border-radius:4px; height:8px; overflow:hidden; max-width:420px;">
+          <div style="background:var(--teal); height:100%; width:${pct}%; transition:width .2s;"></div>
+        </div>
+        <p class="no-history" style="font-size:12px;">
+          ${secs}s elapsed${left !== null ? ` · about ${left}s left` : ''} — keep this tab open
+        </p>`;
+      await new Promise(r => setTimeout(r, 0));   // let the screen repaint
+
       const { error } = await sb.from('purchase_history').insert(chunk);
       if(!error) inserted += chunk.length; else lastError = error;
     }
