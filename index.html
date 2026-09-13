@@ -626,7 +626,9 @@ function repeatsTabHTML(){
         </label>
         <button class="btn btn-ghost" id="downloadSamplePurchaseDataBtn">Download sample format</button>
       </div>
-      <p class="hint" style="margin:10px 0 0;">Expected columns: <span class="mono">item code</span>, <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">In Date</span> (when goods were received), <span class="mono">quantity</span>. Optional: <span class="mono">Bill Date</span> (when the invoice was raised — separate from In Date), <span class="mono">MRP</span>, <span class="mono">invoice amount</span>, <span class="mono">margin</span> (calculated automatically from MRP + invoice amount if not given). <strong>Include the item code</strong> — it matches exactly, so spelling differences in the medicine name can't cause a row to be dropped.</p>
+      <p class="hint" style="margin:10px 0 0;">Expected columns: <span class="mono">item code</span>, <span class="mono">item name</span>, <span class="mono">pack size</span>, <span class="mono">distributor</span>, <span class="mono">In Date</span> (when goods were received), <span class="mono">quantity</span>. Optional: <span class="mono">Bill Date</span> (when the invoice was raised — separate from In Date), <span class="mono">MRP</span>, <span class="mono">invoice amount</span>, <span class="mono">margin</span> (calculated automatically from MRP + invoice amount if not given). <span class="mono">Batch</span>, <span class="mono">Expiry</span> (MM/YY), <span class="mono">Location</span>.
+      <strong>Include the item code</strong> — it matches exactly, so spelling differences in the medicine name can't cause a row to be dropped.
+      <strong>Include the batch</strong> if you want to use returns — it is what links stock on the shelf back to the distributor who supplied it.</p>
       <div id="purchaseDataResult"></div>
       <div style="margin-top:16px;">
         <p class="hint" style="margin-bottom:8px;"><strong>Upload history — check this before uploading, to avoid re-uploading the same dates:</strong></p>
@@ -995,13 +997,15 @@ function downloadSamplePurchaseDataFormat(){
   const rows = [
     { 'Item Code': 'M0004521', 'Item Name': 'Amlopres 5 Tablet', 'Pack Size': '30 Tablet',
       'Distributor': 'Acorns Health Solutions Private Limited',
+      'Batch': 'ABO12ABB', 'Expiry': '03/28', 'Location': 'F-1',
       'Bill Date': '2026-08-14', 'In Date': '2026-08-15', 'Quantity': 20, 'MRP': 4500, 'Invoice Amount': 3200, 'Margin': 28.9 },
     { 'Item Code': 'M0012004', 'Item Name': 'Pan D Capsule', 'Pack Size': '15 Capsules',
       'Distributor': 'Jeplus Healthcare Private Limited',
+      'Batch': '25500689', 'Expiry': '11/27', 'Location': 'J-5-4-3',
       'Bill Date': '2026-08-15', 'In Date': '2026-08-15', 'Quantity': 10, 'MRP': 1200, 'Invoice Amount': 950, 'Margin': '' },
   ];
   const ws = XLSX.utils.json_to_sheet(rows);
-  ws['!cols'] = [{wch:14},{wch:32},{wch:16},{wch:38},{wch:13},{wch:13},{wch:10},{wch:10},{wch:15},{wch:10}];
+  ws['!cols'] = [{wch:14},{wch:32},{wch:16},{wch:38},{wch:14},{wch:10},{wch:12},{wch:13},{wch:13},{wch:10},{wch:10},{wch:15},{wch:10}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Sample Purchase Data');
   XLSX.writeFile(wb, 'sample_purchase_data_format.xlsx');
@@ -1098,6 +1102,9 @@ async function handlePurchaseDataUpload(e){
     const itemCol = [find('item','name'), find('medicine','name'), find('item')]
                     .find(c => c && c !== codeCol);
     const packCol = find('pack');
+    const batchCol = find('batch');
+    const expCol = find('expiry') || find('exp', 'date');
+    const locCol = find('location') || find('rack');
     const distCol = find('distributor');
     const inDateCol = cols.find(c => /\bin\b.*\bdate\b|\bdate\b.*\bin\b/i.test(c)) || find('purchase','date') || find('date');
     const billDateCol = find('bill','date');
@@ -1191,7 +1198,41 @@ async function handlePurchaseDataUpload(e){
       return null;
     }
 
+    // Expiry on a pharma invoice is a month, not a day: "03/28",
+    // "11/2027". Stored as the LAST day of that month, because
+    // that is when the stock actually stops being sellable.
+    function parseExpiry(v){
+      if(v === null || v === undefined || String(v).trim() === '') return null;
+      if(v instanceof Date && !isNaN(v))
+        return `${v.getFullYear()}-${String(v.getMonth()+1).padStart(2,'0')}-${String(v.getDate()).padStart(2,'0')}`;
+      const s = String(v).trim();
+      const endOfMonth = (y, m) => {
+        if(m < 1 || m > 12 || y < 2000 || y > 2100) return null;
+        const d = new Date(y, m, 0);   // day 0 of next month = last of this
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      };
+      // MM/YY or MM/YYYY
+      let m = s.match(/^(\d{1,2})[\/\-.](\d{2,4})$/);
+      if(m){
+        let y = parseInt(m[2], 10);
+        if(y < 100) y += 2000;
+        return endOfMonth(y, parseInt(m[1], 10));
+      }
+      // full date, day first
+      m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+      if(m){
+        let y = parseInt(m[3], 10);
+        if(y < 100) y += 2000;
+        return endOfMonth(y, parseInt(m[2], 10));
+      }
+      // YYYY-MM
+      m = s.match(/^(\d{4})[\/\-.](\d{1,2})$/);
+      if(m) return endOfMonth(parseInt(m[1],10), parseInt(m[2],10));
+      return null;
+    }
+
     let itemUnmatched = 0, distUnmatched = 0, dateInvalid = 0;
+    let batchMissing = 0, expiryUnreadable = 0;
     let matchedByCode = 0, matchedByName = 0;
     const toInsert = [];
     const dates = [];
@@ -1226,6 +1267,8 @@ async function handlePurchaseDataUpload(e){
         return;
       }
       if(res.how === 'code') matchedByCode++; else matchedByName++;
+      if(batchCol && !String(r[batchCol] ?? '').trim()) batchMissing++;
+      if(expCol && String(r[expCol] ?? '').trim() && !parseExpiry(r[expCol])) expiryUnreadable++;
       const itemId = res.id;
 
       const distId = resolveDistributor(r[distCol]);
@@ -1252,6 +1295,9 @@ async function handlePurchaseDataUpload(e){
         warehouse_id: warehouseId, item_id: itemId, distributor_id: distId,
         purchase_date: dateStr, bill_date: billDateStr, raw_medicine_name: String(r[itemCol]),
         pack_size: packCol ? String(r[packCol]||'') : null,
+        batch: batchCol ? (String(r[batchCol] ?? '').trim() || null) : null,
+        expiry: expCol ? parseExpiry(r[expCol]) : null,
+        location: locCol ? (String(r[locCol] ?? '').trim() || null) : null,
         total_quantity: parseInt(r[qtyCol]) || 0,
         total_mrp: isNaN(mrp) ? null : mrp,
         total_invoice_amount: isNaN(invAmt) ? null : invAmt,
@@ -1318,7 +1364,20 @@ async function handlePurchaseDataUpload(e){
           ? ` <span style="color:var(--amber);">(add an Item Code column so these match exactly too)</span>`
           : ''}
         ${totalSkipped ? ` · <strong style="color:var(--red);">Skipped: ${totalSkipped}</strong>` : ''}
-      </p>`
+      </p>
+      ${!batchCol
+        ? `<p class="no-history" style="color:var(--amber);">
+             No <strong>Batch</strong> column in this file. Batch is what links stock on the
+             shelf back to the distributor who supplied it — without it these rows cannot be
+             used for returns.</p>`
+        : (batchMissing
+            ? `<p class="no-history" style="color:var(--amber);">
+                 ${batchMissing} row(s) had no batch number — those cannot be returned.</p>`
+            : `<p class="no-history" style="color:var(--green);">Batch numbers recorded on every row.</p>`)}
+      ${expiryUnreadable
+        ? `<p class="no-history" style="color:var(--amber);">
+             ${expiryUnreadable} expiry value(s) could not be read — use MM/YY, e.g. 03/28.</p>`
+        : ''}`
       + skippedRowsHTML();
     attachSkippedDownloadHandler();
     e.target.value = '';
@@ -3062,13 +3121,12 @@ function handleAfternoonUpload(e){
   else reader.readAsArrayBuffer(file);
 }
 
+// Exact date and time, e.g. "09 Sep, 11:30 AM". Words like
+// "this morning" read well but hide whether an order was placed
+// at 9am or 2pm, which matters when deciding to reorder.
 function aftWhen(d){
-  const s = x => { const y = new Date(x); y.setHours(0,0,0,0); return y; };
-  const days = Math.round((s(new Date()) - s(d)) / 86400000);
-  const part = d.getHours() < 12 ? 'morning' : d.getHours() < 17 ? 'afternoon' : 'evening';
-  if(days === 0) return `this ${part}`;
-  if(days === 1) return `yesterday ${part}`;
-  return `${days} days ago`;
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+       + ', ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true });
 }
 
 function renderAfternoonResults(){
