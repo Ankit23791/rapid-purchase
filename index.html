@@ -1341,29 +1341,37 @@ async function handlePurchaseDataUpload(e){
 
     let inserted = 0, lastError = null;
     const started = Date.now();
-    for(let i=0; i<toInsert.length; i+=500){
-      const chunk = toInsert.slice(i, i+500);
-      // show progress — a long upload used to look identical to a stuck one
-      const done = Math.min(i + 500, toInsert.length);
+    // Progress is drawn showing the batch about to be sent, then
+    // redrawn once it lands. Counting a batch as done before the
+    // insert returned made the bar sit at 100% while the last one
+    // was still in flight, which looked frozen.
+    const drawProgress = (done, sending) => {
       const pct = Math.round(done / toInsert.length * 100);
       const secs = Math.round((Date.now() - started) / 1000);
-      const left = i > 0
-        ? Math.round((Date.now() - started) / i * (toInsert.length - i) / 1000)
+      const left = done > 0
+        ? Math.round((Date.now() - started) / done * (toInsert.length - done) / 1000)
         : null;
       resultEl.innerHTML = `
         <p class="no-history" style="font-style:normal; font-weight:600;">
-          Saving ${done.toLocaleString()} of ${toInsert.length.toLocaleString()} rows (${pct}%)
+          Saved ${done.toLocaleString()} of ${toInsert.length.toLocaleString()} rows (${pct}%)
         </p>
         <div style="background:var(--border); border-radius:4px; height:8px; overflow:hidden; max-width:420px;">
           <div style="background:var(--teal); height:100%; width:${pct}%; transition:width .2s;"></div>
         </div>
         <p class="no-history" style="font-size:12px;">
-          ${secs}s elapsed${left !== null ? ` · about ${left}s left` : ''} — keep this tab open
+          ${secs}s elapsed${left ? ` · about ${left}s left` : ''}${sending ? ' · sending next batch...' : ''} — keep this tab open
         </p>`;
+    };
+
+    for(let i=0; i<toInsert.length; i+=500){
+      const chunk = toInsert.slice(i, i+500);
+      drawProgress(inserted, true);
       await new Promise(r => setTimeout(r, 0));   // let the screen repaint
 
       const { error } = await sb.from('purchase_history').insert(chunk);
       if(!error) inserted += chunk.length; else lastError = error;
+      drawProgress(inserted, false);
+      await new Promise(r => setTimeout(r, 0));
     }
 
     if(inserted > 0){
@@ -3434,6 +3442,13 @@ function retParseExpiry(v){
     return new Date(y, m, 0);
   };
   if(v instanceof Date && !isNaN(v)) return v;
+  // Excel keeps a date cell as a serial number. Without this the
+  // expiry silently came back empty and every item fell back to a
+  // default shelf life.
+  if(typeof v === 'number' && isFinite(v) && v > 20000 && v < 80000){
+    const d = new Date(Math.round((v - 25569) * 86400000));
+    return eom(d.getUTCFullYear(), d.getUTCMonth() + 1);
+  }
   const s = String(v).trim();
   let m = s.match(/^(\d{1,2})[\/\-.](\d{2,4})$/);
   if(m){ let y = parseInt(m[2],10); if(y<100) y += 2000; return eom(y, parseInt(m[1],10)); }
@@ -3621,8 +3636,8 @@ function handleReturnsUpload(e){
 
       let keep;
       if(monthly <= 0){
-        keep = 0;
-        reason = 'Not sold in the last 30 days';
+        keep = 1;
+        reason = 'Not sold in the last 30 days — keeping 1 in case someone asks';
       } else if(expectedSales < 1){
         keep = 1;
         reason = `Only ${expectedSales.toFixed(1)} expected to sell before it goes short-dated`;
@@ -3630,7 +3645,21 @@ function handleReturnsUpload(e){
         keep = Math.min(Number(a.max_stock) || Math.ceil(expectedSales), Math.ceil(expectedSales));
         reason = `Expect to sell ${expectedSales.toFixed(1)} in ${sellableMonths.toFixed(1)} sellable months`;
       }
-      if(a.can_order === false && monthly <= 0){ keep = 0; reason = 'Blocked in the analysis and not selling'; }
+      if(a.can_order === false && monthly <= 0){
+        keep = 1;
+        reason = 'Blocked in the analysis and not selling — keeping 1';
+      }
+      // Never strip an item to zero. A customer may still ask for it,
+      // and having none at all means losing the sale and the customer.
+      // The one exception is stock already too short-dated to sell.
+      const shortDated = nearest && retMonths(nearest, new Date()) <= RET_DEAD_MONTHS;
+      if(shortDated){
+        keep = 0;
+        reason = `Expires ${nearest.toLocaleDateString('en-GB',{month:'short',year:'2-digit'})} — too short-dated to sell, return all`;
+      } else {
+        keep = Math.max(1, keep);
+      }
+      keep = Math.min(keep, totalStock);
 
       keepLeft = keep;
       batches.forEach(b=>{
