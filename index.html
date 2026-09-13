@@ -275,7 +275,8 @@ function renderMain(){
       <button data-tab="order" class="${state.activeTab==='order'?'active':''}">New Order</button>
       <button data-tab="repeats" class="${state.activeTab==='repeats'?'active':''}">Repeat Orders</button>
       <button data-tab="afternoon" class="${state.activeTab==='afternoon'?'active':''}">Afternoon Check</button>
-      ${isAdmin() ? `<button data-tab="returns" class="${state.activeTab==='returns'?'active':''}">Returns</button>` : ''}
+      ${isAdmin() ? `<button data-tab="returns" class="${state.activeTab==='returns'?'active':''}">Returns</button>
+      <button data-tab="purchasecheck" class="${state.activeTab==='purchasecheck'?'active':''}">Purchase Check</button>` : ''}
       ${isAdmin() ? `
       <button data-tab="inventory" class="${state.activeTab==='inventory'?'active':''}">Inventory</button>
       <button data-tab="refill" class="${state.activeTab==='refill'?'active':''}">Refill Needed</button>
@@ -318,6 +319,7 @@ function renderTabContent(){
   else if(state.activeTab === 'refill'){ el.innerHTML = refillTabHTML(); initRefillTab(); }
   else if(state.activeTab === 'afternoon'){ el.innerHTML = afternoonTabHTML(); initAfternoonTab(); }
   else if(state.activeTab === 'returns'){ el.innerHTML = returnsTabHTML(); initReturnsTab(); }
+  else if(state.activeTab === 'purchasecheck'){ el.innerHTML = pchkTabHTML(); initPchkTab(); }
   else if(state.activeTab === 'match'){ el.innerHTML = matchTabHTML(); loadMatchDistributors(); }
   else el.innerHTML = adminTabHTML();
   attachTabHandlers();
@@ -3880,6 +3882,320 @@ function downloadReturnsExcel(){
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Returns');
   XLSX.writeFile(wb, `returns_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+// ============================================================
+// PURCHASE CHECK
+//
+// Returns catch a bad purchase three months later, when the
+// return window is nearly shut. This catches it within days,
+// while there is still time to send it back.
+//
+// Everything here comes from purchase_history joined to the
+// analysis snapshot. No stock sheet: today's stock cannot tell
+// you whether a decision made three weeks ago was right.
+// ============================================================
+
+const PCHK = { rows: [], warehouseId: null, snapshotDate: null, from: null, to: null };
+
+function pchkTabHTML(){
+  const today = new Date();
+  const weekAgo = new Date(Date.now() - 7*86400000);
+  const iso = d => d.toISOString().slice(0,10);
+  return `
+    <div class="card">
+      <h2>Purchase check</h2>
+      <p class="hint">What was bought that probably should not have been — while there is still
+      time to send it back. Opens on the last 7 days; change the dates for any other period.</p>
+      <label>Warehouse</label>
+      <select id="pchkWarehouse" style="max-width:360px; margin-bottom:12px;">
+        ${state.warehouses.map(w=>`<option value="${w.id}" ${w.id===state.currentWarehouse?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}
+      </select>
+      <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
+        <div><label>From</label><input type="date" id="pchkFrom" value="${iso(weekAgo)}" style="max-width:170px;"></div>
+        <div><label>To</label><input type="date" id="pchkTo" value="${iso(today)}" style="max-width:170px;"></div>
+        <button class="btn btn-primary" id="pchkRun" style="margin-bottom:1px;">Check</button>
+      </div>
+      <div id="pchkResult"></div>
+    </div>`;
+}
+
+async function initPchkTab(){
+  const sel = document.getElementById('pchkWarehouse');
+  PCHK.warehouseId = sel.value;
+  sel.addEventListener('change', ()=>{ PCHK.warehouseId = sel.value; runPchk(); });
+  document.getElementById('pchkRun').addEventListener('click', runPchk);
+  runPchk();
+}
+
+const pchkMoney = n => '\u20b9' + Math.round(Number(n)||0).toLocaleString('en-IN');
+const pchkNorm  = s => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+
+async function runPchk(){
+  const el = document.getElementById('pchkResult');
+  const wh = PCHK.warehouseId;
+  const from = document.getElementById('pchkFrom').value;
+  const to   = document.getElementById('pchkTo').value;
+  if(!from || !to){ el.innerHTML = `<p class="no-history" style="color:var(--red);">Pick both dates.</p>`; return; }
+  if(from > to){ el.innerHTML = `<p class="no-history" style="color:var(--red);">The From date is after the To date.</p>`; return; }
+  PCHK.from = from; PCHK.to = to;
+
+  el.innerHTML = `<p class="no-history">Checking purchases...</p>`;
+
+  const snapRes = await sb.from('medicine_analysis_snapshots').select('snapshot_date')
+    .eq('warehouse_id', wh).order('snapshot_date',{ascending:false}).limit(1).maybeSingle();
+  PCHK.snapshotDate = snapRes.data ? snapRes.data.snapshot_date : null;
+  if(!PCHK.snapshotDate){
+    el.innerHTML = `<p class="no-history" style="color:var(--red);">
+      No analysis uploaded for this warehouse — there is nothing to judge the purchases against.</p>`;
+    return;
+  }
+
+  const [purch, analysis, itemsData, dists, everBefore] = await Promise.all([
+    fetchAllRows('purchase_history',
+      'item_id, distributor_id, purchase_date, batch, expiry, total_quantity, total_invoice_amount',
+      q => q.eq('warehouse_id', wh).gte('purchase_date', from).lte('purchase_date', to)),
+    fetchAllRows('medicine_analysis_snapshots',
+      'item_id, min_stock, max_stock, medicine_type, qty_30d, qty_90d, can_order, stock_logic, trend',
+      q => q.eq('warehouse_id', wh).eq('snapshot_date', PCHK.snapshotDate)),
+    fetchAllRows('items', 'id, code, item_name, pack_size'),
+    sb.from('distributors').select('id, name, accepts_returns, return_window_days'),
+    // everything bought BEFORE this window, to spot first-time purchases
+    fetchAllRows('purchase_history', 'item_id', q => q.eq('warehouse_id', wh).lt('purchase_date', from)),
+  ]);
+
+  const item = {}; itemsData.forEach(i => { item[i.id] = i; });
+  const ana  = {}; analysis.forEach(a => { ana[a.item_id] = a; });
+  const dmap = {}; (dists.data||[]).forEach(d => { dmap[d.id] = d; });
+  const seenBefore = new Set(everBefore.map(r => r.item_id));
+
+  // duplicate codes: same normalised name + pack under 2+ ids
+  const keyToIds = {};
+  itemsData.forEach(i=>{
+    const k = pchkNorm(i.item_name) + '|' + pchkNorm(i.pack_size);
+    (keyToIds[k] = keyToIds[k] || []).push(i.id);
+  });
+  const dupKeys = {};
+  Object.entries(keyToIds).forEach(([k, ids]) => { if(ids.length > 1) dupKeys[k] = ids; });
+
+  // group the purchases by item
+  const byItem = {};
+  purch.forEach(p=>{
+    if(!byItem[p.item_id]) byItem[p.item_id] = { lines: [], qty: 0, value: 0, dates: new Set() };
+    const g = byItem[p.item_id];
+    g.lines.push(p);
+    g.qty += Number(p.total_quantity)||0;
+    g.value += Number(p.total_invoice_amount)||0;
+    g.dates.add(p.purchase_date);
+  });
+
+  const today = new Date(); today.setHours(0,0,0,0);
+  const flags = [];
+  let totalSpend = 0;
+  const groupSpend = {}, groupCount = {};
+
+  Object.entries(byItem).forEach(([itemId, g])=>{
+    const it = item[itemId];
+    const a = ana[itemId];
+    totalSpend += g.value;
+
+    const grp = a ? (a.medicine_type || 'Unknown') : 'Not in analysis';
+    groupSpend[grp] = (groupSpend[grp]||0) + g.value;
+    groupCount[grp] = (groupCount[grp]||0) + 1;
+
+    if(!it || !a) return;
+    const sold30 = Number(a.qty_30d) || 0;
+    const times = g.dates.size;
+
+    // the distributor and deadline come from the most recent line
+    const last = g.lines.slice().sort((x,y)=> y.purchase_date.localeCompare(x.purchase_date))[0];
+    const d = dmap[last.distributor_id];
+    const windowDays = d ? (d.return_window_days || 90) : 90;
+    const closes = new Date(new Date(last.purchase_date+'T00:00:00').getTime() + windowDays*86400000);
+    const daysLeft = Math.round((closes - today)/86400000);
+
+    const base = {
+      itemId, name: it.item_name, pack: it.pack_size, code: it.code,
+      group: grp, qty: g.qty, value: g.value, times, sold30,
+      maxStock: a.max_stock, distributor: d ? d.name : 'Unknown',
+      canReturn: d ? d.accepts_returns !== false : true,
+      daysLeft, closes, batch: last.batch,
+      dates: [...g.dates].sort(),
+    };
+
+    // --- the checks, most serious first ---------------------
+    const k = pchkNorm(it.item_name) + '|' + pchkNorm(it.pack_size);
+    if(dupKeys[k]){
+      const others = dupKeys[k].filter(id => id !== itemId).map(id => item[id]).filter(Boolean);
+      const otherBought = others.filter(o => byItem[o.id]);
+      if(otherBought.length){
+        flags.push({ ...base, type: 'Duplicate code',
+          detail: `Also bought under code ${otherBought.map(o=>o.code).join(', ')} in this period — stock is split, so neither code looks like enough` });
+        return;
+      }
+    }
+    if(times >= 2 && sold30 === 0){
+      flags.push({ ...base, type: 'Repeat buying, no sales',
+        detail: `Bought on ${times} separate days (${base.dates.join(', ')}) and sold nothing in 30 days` });
+      return;
+    }
+    if(a.can_order === false){
+      flags.push({ ...base, type: 'Blocked item',
+        detail: a.stock_logic || 'Marked do-not-order in the analysis' });
+      return;
+    }
+    if(sold30 === 0 && g.qty > 0){
+      flags.push({ ...base, type: 'Bought, never sells',
+        detail: 'No sale in the last 30 days' });
+      return;
+    }
+    if(a.max_stock && g.qty > Number(a.max_stock) * 2){
+      flags.push({ ...base, type: 'Quantity too high',
+        detail: `Bought ${g.qty} against a max stock level of ${a.max_stock}` });
+      return;
+    }
+    if(!seenBefore.has(itemId)){
+      flags.push({ ...base, type: 'New item',
+        detail: 'First time this medicine has ever been bought' });
+    }
+  });
+
+  PCHK.rows = flags;
+  renderPchk(totalSpend, groupSpend, groupCount, Object.keys(byItem).length, analysis);
+}
+
+function renderPchk(totalSpend, groupSpend, groupCount, itemCount, analysis){
+  const el = document.getElementById('pchkResult');
+  const order = ['Duplicate code','Repeat buying, no sales','Blocked item','Bought, never sells','Quantity too high','New item'];
+  const colour = {
+    'Duplicate code':'var(--red)', 'Repeat buying, no sales':'var(--red)',
+    'Blocked item':'var(--red)', 'Bought, never sells':'var(--amber)',
+    'Quantity too high':'var(--amber)', 'New item':'var(--muted)',
+  };
+
+  const byType = {};
+  PCHK.rows.forEach(r => { (byType[r.type] = byType[r.type] || []).push(r); });
+
+  const problems = PCHK.rows.filter(r => r.type !== 'New item');
+  const problemValue = problems.reduce((s,r)=> s + r.value, 0);
+  const returnable = problems.filter(r => r.canReturn && r.daysLeft > 0);
+
+  // share of sales by group, for comparison against spend
+  const salesByGroup = {};
+  let totalSales = 0;
+  analysis.forEach(a=>{
+    const g = a.medicine_type || 'Unknown';
+    const v = Number(a.qty_30d) || 0;
+    salesByGroup[g] = (salesByGroup[g]||0) + v;
+    totalSales += v;
+  });
+
+  const fmtRange = `${new Date(PCHK.from+'T00:00:00').toLocaleDateString('en-GB',{day:'2-digit',month:'short'})} to ${new Date(PCHK.to+'T00:00:00').toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})}`;
+
+  el.innerHTML = `
+    <div class="item-row" style="margin-top:6px;">
+      <p class="no-history" style="font-style:normal; font-weight:600; font-size:16px; color:var(--ink); margin:0 0 4px;">
+        ${fmtRange} &middot; ${itemCount} medicine(s) bought &middot; ${pchkMoney(totalSpend)}
+      </p>
+      <p class="no-history" style="font-style:normal; margin:0 0 10px;">
+        ${problems.length
+          ? `<strong style="color:var(--red);">${problems.length} questionable &middot; ${pchkMoney(problemValue)}</strong>
+             ${totalSpend ? `(${Math.round(problemValue/totalSpend*100)}% of spend)` : ''}
+             ${returnable.length ? ` &middot; <span style="color:var(--green);">${returnable.length} still inside the return window</span>` : ''}`
+          : `<strong style="color:var(--green);">Nothing questionable found.</strong>`}
+      </p>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-ghost" id="pchkDownload">Download as Excel</button>
+      </div>
+
+      <p class="no-history" style="font-style:normal; font-weight:600; margin:16px 0 6px;">Where the money went</p>
+      <table class="summary">
+        <tr><th>Group</th><th>Medicines</th><th>Spend</th><th>% of spend</th><th>% of sales</th><th></th></tr>
+        ${Object.entries(groupSpend).sort((a,b)=>b[1]-a[1]).map(([g,v])=>{
+          const spendPct = totalSpend ? v/totalSpend*100 : 0;
+          const salesPct = totalSales ? (salesByGroup[g]||0)/totalSales*100 : 0;
+          const gap = spendPct - salesPct;
+          const warn = Math.abs(gap) >= 8;
+          return `<tr>
+            <td>${escapeHtml(g)}</td>
+            <td style="text-align:center;">${groupCount[g]}</td>
+            <td style="text-align:right;">${pchkMoney(v)}</td>
+            <td style="text-align:right;">${spendPct.toFixed(0)}%</td>
+            <td style="text-align:right; color:var(--muted);">${salesPct.toFixed(0)}%</td>
+            <td style="font-size:11px; color:${warn ? (gap>0?'var(--red)':'var(--amber)') : 'var(--muted)'};">
+              ${warn ? (gap>0 ? 'buying more than it sells' : 'buying less than it sells') : ''}</td>
+          </tr>`;
+        }).join('')}
+      </table>
+      <p class="no-history" style="font-size:11px; margin:4px 0 0;">
+        Share of sales is from the latest analysis, by quantity sold in 30 days.
+      </p>
+
+      ${order.filter(t=>byType[t]).map(t=>{
+        const rows = byType[t].sort((a,b)=> b.value - a.value);
+        const val = rows.reduce((s,r)=>s+r.value,0);
+        return `
+        <div style="margin-top:18px; border-top:2px solid ${colour[t]}; padding-top:10px;">
+          <p class="no-history" style="font-style:normal; font-weight:600; color:${colour[t]}; margin:0 0 8px;">
+            ${escapeHtml(t)} &mdash; ${rows.length} medicine(s) &middot; ${pchkMoney(val)}
+          </p>
+          <div style="overflow-x:auto;">
+          <table class="summary">
+            <tr><th>Medicine</th><th>Code</th><th>Group</th><th>Sold 30d</th><th>Bought</th>
+                <th>Times</th><th>Spend</th><th>Distributor</th><th>Return by</th><th>What happened</th></tr>
+            ${rows.map(r=>`
+              <tr>
+                <td>${escapeHtml(r.name)}<div style="color:var(--muted); font-size:11px;">${escapeHtml(r.pack||'')}</div></td>
+                <td class="mono" style="font-size:11px;">${escapeHtml(r.code||'')}</td>
+                <td style="font-size:11px;">${escapeHtml(r.group)}</td>
+                <td style="text-align:center;">${r.sold30}</td>
+                <td style="text-align:center;">${r.qty}</td>
+                <td style="text-align:center;">${r.times}</td>
+                <td style="text-align:right; font-weight:600;">${pchkMoney(r.value)}</td>
+                <td style="font-size:11px;">${escapeHtml(r.distributor)}</td>
+                <td style="white-space:nowrap; font-size:11px; color:${!r.canReturn ? 'var(--muted)' : r.daysLeft<=14 ? 'var(--red)' : r.daysLeft<=30 ? 'var(--amber)' : 'var(--green)'};">
+                  ${!r.canReturn ? 'no returns' : r.daysLeft > 0 ? `${r.daysLeft} days` : 'window closed'}</td>
+                <td style="color:var(--muted); font-size:11px;">${escapeHtml(r.detail)}</td>
+              </tr>`).join('')}
+          </table>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  document.getElementById('pchkDownload').addEventListener('click', downloadPchk);
+}
+
+function downloadPchk(){
+  if(!PCHK.rows.length) return;
+  const out = PCHK.rows
+    .sort((a,b)=> a.type.localeCompare(b.type) || b.value - a.value)
+    .map(r=>({
+      'Problem': r.type,
+      'Medicine Name': r.name,
+      'Pack': r.pack || '',
+      'Item Code': r.code || '',
+      'Group': r.group,
+      'Sold (30d)': r.sold30,
+      'Qty Bought': r.qty,
+      'Times Bought': r.times,
+      'Dates': r.dates.join(', '),
+      'Spend': Math.round(r.value*100)/100,
+      'Max Stock': r.maxStock ?? '',
+      'Distributor': r.distributor,
+      'Batch': r.batch || '',
+      'Return Window Closes': r.canReturn
+        ? r.closes.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})
+        : 'no returns',
+      'Days Left': r.canReturn ? r.daysLeft : '',
+      'What Happened': r.detail,
+    }));
+  const ws = XLSX.utils.json_to_sheet(out);
+  ws['!cols'] = [{wch:24},{wch:32},{wch:14},{wch:12},{wch:16},{wch:10},{wch:11},{wch:12},
+                 {wch:30},{wch:12},{wch:10},{wch:34},{wch:14},{wch:18},{wch:10},{wch:56}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Purchase Check');
+  XLSX.writeFile(wb, `purchase_check_${PCHK.from}_to_${PCHK.to}.xlsx`);
 }
 
 function adminTabHTML(){
